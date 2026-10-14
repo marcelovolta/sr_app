@@ -93,6 +93,7 @@ def recomendador_random(id_lector, N=9):
     return sql_select(query, (id_lector, id_lector))  
 
 def recomendador_top_n(id_lector, N=9):
+    # se exige un mínimo de 5 valoraciones para que un único 10 no domine el ranking
     query = f"""
         WITH t1 AS (
         SELECT li.id_libro, AVG(i.rating) AS promedio_rating 
@@ -102,10 +103,13 @@ def recomendador_top_n(id_lector, N=9):
         AND li.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
         AND li.titulo IS NOT NULL
         GROUP BY li.id_libro
+        HAVING COUNT(*) >= 5
         ORDER BY promedio_rating DESC
         LIMIT {N}
     )
-    SELECT * FROM libros WHERE id_libro IN (SELECT id_libro FROM t1)
+    SELECT libros.* FROM libros
+    INNER JOIN t1 ON t1.id_libro = libros.id_libro
+    ORDER BY t1.promedio_rating DESC
     """
     return sql_select(query, (id_lector, id_lector))
 
@@ -122,19 +126,171 @@ def recomendador_mas_valorados(id_lector, N=9):
         ORDER BY valoraciones DESC
         LIMIT {N}
     )
-    SELECT * FROM libros WHERE id_libro IN (SELECT id_libro FROM t1)
+    SELECT libros.* FROM libros
+    INNER JOIN t1 ON t1.id_libro = libros.id_libro
+    ORDER BY t1.valoraciones DESC
     """
     return sql_select(query, (id_lector, id_lector))
+
+def recomendador_perfil_balanceado(id_lector, N=9):
+    # combina los géneros y autores que el lector valoró (al menos 3 veces)
+    # con la valoración general de cada libro popular (más de 5 valoraciones)
+    query = f"""
+    WITH generos_pref AS (
+        SELECT
+            li.genero,
+            AVG(i.rating) AS promedio_rating,
+            COUNT(*) AS cant_valoraciones,
+            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_genero
+        FROM interacciones AS i
+        INNER JOIN libros AS li ON li.id_libro = i.id_libro
+        WHERE i.id_lector = ?
+        AND COALESCE(i.rating, 0) > 0
+        AND li.genero IS NOT NULL
+        GROUP BY li.genero
+        HAVING COUNT(*) > 2  -- hiperparámetro
+    ),
+
+    autores_pref AS (
+        SELECT
+            li.autor,
+            AVG(i.rating) AS promedio_rating,
+            COUNT(*) AS cant_valoraciones,
+            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_autor
+        FROM interacciones AS i
+        INNER JOIN libros AS li ON li.id_libro = i.id_libro
+        WHERE i.id_lector = ?
+        AND COALESCE(i.rating, 0) > 0
+        AND li.autor IS NOT NULL
+        GROUP BY li.autor
+        HAVING COUNT(*) > 2  -- hiperparámetro
+    ),
+
+    libros_populares AS (
+        SELECT
+            id_libro,
+            AVG(rating) AS promedio_rating,
+            COUNT(*) AS cant_valoraciones,
+            (0.8 * AVG(rating)) + (0.2 * COUNT(*)) AS rating_corr
+        FROM interacciones
+        GROUP BY id_libro
+        HAVING COUNT(*) > 5
+    ),
+
+    seleccion_final AS (
+        SELECT
+            lp.id_libro,
+            (0.4 * COALESCE(gp.rating_corr_genero, 0))
+              + (0.4 * COALESCE(ap.rating_corr_autor, 0))
+              + (0.2 * lp.rating_corr) AS rating_global
+        FROM libros_populares AS lp
+        INNER JOIN libros AS li ON li.id_libro = lp.id_libro
+        LEFT JOIN generos_pref AS gp ON gp.genero = li.genero
+        LEFT JOIN autores_pref AS ap ON ap.autor = li.autor
+        WHERE lp.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
+        AND lp.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
+        AND li.titulo IS NOT NULL
+        ORDER BY rating_global DESC, lp.id_libro
+        LIMIT {N}
+    )
+    SELECT libros.* FROM libros
+    INNER JOIN seleccion_final AS sf ON sf.id_libro = libros.id_libro
+    ORDER BY sf.rating_global DESC, sf.id_libro
+    """
+    return sql_select(query, (id_lector,) * 4)
+
+def recomendador_vision_tunel(id_lector, N=9):
+    # más estricto que perfil_balanceado: el libro tiene que coincidir en género
+    # Y en autor con los favoritos del lector; si no alcanzan N, se completa
+    # con libros populares (orden = 1)
+    query = f"""
+    WITH generos_fav AS (
+        SELECT
+            li.genero,
+            COUNT(*) AS cant_genero,
+            AVG(i.rating) AS promedio_rating,
+            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_genero
+        FROM interacciones AS i
+        INNER JOIN libros AS li ON li.id_libro = i.id_libro
+        WHERE i.id_lector = ?
+        AND COALESCE(i.rating, 0) > 0
+        AND li.genero IS NOT NULL
+        GROUP BY li.genero
+    ),
+
+    autores_fav AS (
+        SELECT
+            li.autor,
+            COUNT(*) AS cant_autor,
+            AVG(i.rating) AS promedio_rating,
+            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_autor
+        FROM interacciones AS i
+        INNER JOIN libros AS li ON li.id_libro = i.id_libro
+        WHERE i.id_lector = ?
+        AND COALESCE(i.rating, 0) > 0
+        AND li.autor IS NOT NULL
+        GROUP BY li.autor
+    ),
+
+    vision_tunel AS (
+        SELECT
+            li.id_libro,
+            af.rating_corr_autor + gf.rating_corr_genero AS rating_final,
+            0 AS orden
+        FROM libros AS li
+        INNER JOIN generos_fav AS gf ON gf.genero = li.genero
+        INNER JOIN autores_fav AS af ON af.autor = li.autor
+        WHERE li.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
+        AND li.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
+        AND li.titulo IS NOT NULL
+    ),
+
+    -- se excluyen explícitamente los libros de vision_tunel para que un libro
+    -- que califica en ambos niveles no aparezca dos veces
+    libros_populares AS (
+        SELECT
+            id_libro,
+            (0.8 * AVG(rating)) + (0.2 * COUNT(*)) AS rating_corr,
+            1 AS orden
+        FROM interacciones
+        WHERE id_libro NOT IN (SELECT id_libro FROM vision_tunel)
+        AND id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
+        AND id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
+        GROUP BY id_libro
+        HAVING COUNT(*) > 5
+    ),
+
+    preseleccion AS (
+        SELECT id_libro, rating_final, orden FROM vision_tunel
+        UNION ALL
+        SELECT id_libro, rating_corr AS rating_final, orden FROM libros_populares
+    )
+    SELECT libros.* FROM preseleccion AS ps
+    INNER JOIN libros ON libros.id_libro = ps.id_libro
+    WHERE libros.titulo IS NOT NULL
+    ORDER BY ps.orden ASC, ps.rating_final DESC, ps.id_libro
+    LIMIT {N}
+    """
+    return sql_select(query, (id_lector,) * 6)
 
 def resetear_recientes(id_lector, fecha_limite='2026-09-01 23:59:59'):
     sql_execute("DELETE FROM vistas WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
     sql_execute("DELETE FROM interacciones WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
 
 
-def recomendar(id_lector, N=9):
-    # return recomendador_random(id_lector, N)
-    # return recomendador_top_n(id_lector, N)
-    rec = recomendador_mas_valorados(id_lector, N)
+ALGORITMOS = {
+    'random': recomendador_random,
+    'top_n': recomendador_top_n,
+    'mas_valorados': recomendador_mas_valorados,
+    'perfil_balanceado': recomendador_perfil_balanceado,
+    'vision_tunel': recomendador_vision_tunel,
+}
+ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
+
+
+def recomendar(id_lector, algoritmo=ALGORITMO_POR_DEFECTO, N=9):
+    recomendador = ALGORITMOS.get(algoritmo, ALGORITMOS[ALGORITMO_POR_DEFECTO])
+    rec = recomendador(id_lector, N)
 
     insertar_vistos(id_lector, rec)
     return rec

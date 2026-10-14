@@ -16,6 +16,19 @@
                 <input type="text" name="id_lector" minlength="3" maxlength="30" required class="p-1 border rounded">
             </label> 
         </div>
+        <div class="mb-4">
+            <label>
+                Algoritmo de recomendación:
+                <select name="algoritmo" id="algoritmo" class="p-1 border rounded" onchange="actualizarDescripcion()">
+                    <option value="perfil_balanceado" selected>Perfil balanceado (personalizado)</option>
+                    <option value="vision_tunel">Visión de túnel (personalizado)</option>
+                    <option value="top_n">Mejor valorados</option>
+                    <option value="mas_valorados">Más valorados</option>
+                    <option value="random">Aleatorio</option>
+                </select>
+            </label>
+            <p id="descripcion-algoritmo" class="text-xs text-neutral-500 mt-1"></p>
+        </div>
         <!--
         <div class="flex mb-4">
             <label>
@@ -52,5 +65,21 @@
             </button>
         </div>
     </form>
+    <script>
+        const descripciones = {
+            perfil_balanceado: "Recomendaciones personalizadas según los géneros y autores que valoraste, ponderadas con la valoración general de cada libro.",
+            vision_tunel: "Una versión más estricta de la recomendación personalizada: el libro tiene que coincidir en género Y en autor con tus favoritos. Si no hay suficientes, se completa con libros populares.",
+            top_n: "Los libros con mejor valoración promedio (con al menos 5 valoraciones) que todavía no valoraste ni viste.",
+            mas_valorados: "Los libros con más valoraciones que todavía no valoraste ni viste.",
+            random: "Una selección al azar de libros que todavía no valoraste ni viste."
+        };
+
+        function actualizarDescripcion() {
+            const select = document.getElementById('algoritmo');
+            document.getElementById('descripcion-algoritmo').textContent = descripciones[select.value] || '';
+        }
+
+        actualizarDescripcion();
+    </script>
 </body>
 </html>
