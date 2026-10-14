@@ -71,6 +71,8 @@ def insertar_vistos(id_lector, libros):
 
 
 def insertar_valorado(id_lector, id_libro, rating):
+    # TODO: permitir que el lector actualice una valoración ya existente
+    # (hoy ON CONFLICT DO NOTHING ignora la nueva puntuación en silencio)
     fecha = datetime.now()
     query="""
         INSERT INTO interacciones (id_lector, id_libro, fecha, rating) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
