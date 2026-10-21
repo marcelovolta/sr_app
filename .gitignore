@@ -4,3 +4,6 @@ __pycache__/
 data/*.db
 data/*.db-journal
 .DS_Store
+
+# modelos de Surprise entrenados (se regeneran si no están)
+modelos/

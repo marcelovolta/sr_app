@@ -25,6 +25,9 @@
                     <option value="top_n">Mejor valorados</option>
                     <option value="mas_valorados">Más valorados</option>
                     <option value="random">Aleatorio</option>
+                    <option value="baseline">Baseline (Surprise)</option>
+                    <option value="knn">KNN (Surprise)</option>
+                    <option value="svd">SVD (Surprise)</option>
                 </select>
             </label>
             <p id="descripcion-algoritmo" class="text-xs text-neutral-500 mt-1"></p>
@@ -71,7 +74,10 @@
             vision_tunel: "Una versión más estricta de la recomendación personalizada: el libro tiene que coincidir en género Y en autor con tus favoritos. Si no hay suficientes, se completa con libros populares.",
             top_n: "Los libros con mejor valoración promedio (con al menos 5 valoraciones) que todavía no valoraste ni viste.",
             mas_valorados: "Los libros con más valoraciones que todavía no valoraste ni viste.",
-            random: "Una selección al azar de libros que todavía no valoraste ni viste."
+            random: "Una selección al azar de libros que todavía no valoraste ni viste.",
+            baseline: "Estima tu valoración de cada libro con la media general más tu sesgo como lector y el sesgo del libro (BaselineOnly).",
+            knn: "Estima tu valoración a partir de los 40 lectores con gustos más parecidos a los tuyos (KNNWithMeans). Si todavía no tenés suficientes valoraciones, usa Baseline.",
+            svd: "Estima tu valoración con factores latentes de lectores y libros, aprendidos por factorización de matrices (SVD)."
         };
 
         function actualizarDescripcion() {

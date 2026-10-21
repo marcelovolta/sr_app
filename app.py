@@ -31,6 +31,15 @@ def get_recomendar(id_lector, algoritmo):
     return render_template('recomendaciones.html', cant_vistos=cant_vistos, cant_valorados=cant_valorados, libros_recomendados=libros_recomendados, id_lector=id_lector, algoritmo=algoritmo)
 
 
+@app.get('/predecir/<algoritmo>')
+def get_predecir(algoritmo):
+    # genera data/prediction_<algoritmo>.csv a partir de data/prediction_base.csv
+    if algoritmo not in recomendador.ALGORITMOS:
+        return {'error': f'Algoritmo desconocido: {algoritmo}', 'algoritmos': list(recomendador.ALGORITMOS)}, 400
+    archivo, cant_lectores = recomendador.generar_predicciones(algoritmo)
+    return {'algoritmo': algoritmo, 'archivo': archivo, 'lectores': cant_lectores}
+
+
 @app.post('/recomendar/<id_lector>/<algoritmo>')
 def post_recomendar(id_lector, algoritmo):
     # guardar los ítems puntuados, y volver a recomendar

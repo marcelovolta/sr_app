@@ -1,9 +1,16 @@
 import sqlite3
 import os
+import csv
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from datetime import datetime
+
+import modelos_surprise
 
 
 DATABASE_FILE = os.path.dirname(__file__) + '/data/data.db'
+PREDICCION_BASE_FILE = os.path.dirname(__file__) + '/data/prediction_base.csv'
 
 def sql_select(query, params=()):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -273,6 +280,34 @@ def recomendador_vision_tunel(id_lector, N=9):
     """
     return sql_select(query, (id_lector,) * 6)
 
+def recomendador_surprise(nombre, id_lector, N=9):
+    # los N libros con mayor rating estimado por el modelo de Surprise,
+    # excluyendo los que el lector ya valoró o vio, y los que no tienen título
+    excluidos = {r['id_libro'] for r in sql_select("""
+        SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0
+        UNION
+        SELECT id_libro FROM vistas WHERE id_lector = ?
+    """, (id_lector, id_lector))}
+    con_titulo = {r['id_libro'] for r in sql_select("SELECT id_libro FROM libros WHERE titulo IS NOT NULL")}
+
+    ranking = modelos_surprise.ranking(nombre, DATABASE_FILE, id_lector)
+    top = list(islice((id_libro for id_libro, _ in ranking if id_libro not in excluidos and id_libro in con_titulo), N))
+    if not top:
+        return []
+
+    libros = sql_select(f"SELECT * FROM libros WHERE id_libro IN ({', '.join('?' * len(top))})", top)
+    posicion = {id_libro: i for i, id_libro in enumerate(top)}
+    return sorted(libros, key=lambda r: posicion[r['id_libro']])
+
+def recomendador_baseline(id_lector, N=9):
+    return recomendador_surprise('baseline', id_lector, N)
+
+def recomendador_knn(id_lector, N=9):
+    return recomendador_surprise('knn', id_lector, N)
+
+def recomendador_svd(id_lector, N=9):
+    return recomendador_surprise('svd', id_lector, N)
+
 def resetear_recientes(id_lector, fecha_limite='2026-09-01 23:59:59'):
     sql_execute("DELETE FROM vistas WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
     sql_execute("DELETE FROM interacciones WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
@@ -284,6 +319,9 @@ ALGORITMOS = {
     'mas_valorados': recomendador_mas_valorados,
     'perfil_balanceado': recomendador_perfil_balanceado,
     'vision_tunel': recomendador_vision_tunel,
+    'baseline': recomendador_baseline,
+    'knn': recomendador_knn,
+    'svd': recomendador_svd,
 }
 ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
 
@@ -294,3 +332,39 @@ def recomendar(id_lector, algoritmo=ALGORITMO_POR_DEFECTO, N=9):
 
     insertar_vistos(id_lector, rec)
     return rec
+
+
+def generar_predicciones(algoritmo, workers=8):
+    # completa prediction_base.csv con los libros recomendados a cada lector,
+    # de mayor a menor puntaje. A diferencia de recomendar(), no los registra como vistos
+    recomendador = ALGORITMOS[algoritmo]
+
+    with open(PREDICCION_BASE_FILE, newline='', encoding='utf-8') as f:
+        filas = [fila['id_lector'] for fila in csv.DictReader(f)]
+
+    # cada lector pide tantos libros como veces aparece en el archivo base (20)
+    cant_por_lector = Counter(filas)
+    def libros_de(id_lector):
+        return [r['id_libro'] for r in recomendador(id_lector, cant_por_lector[id_lector])]
+
+    # cada consulta abre su propia conexión, así que se pueden correr en paralelo.
+    # Los modelos de Surprise no: calculan en Python y no en SQLite, y con varios
+    # hilos compitiendo por el GIL tardan ~13 veces más que con uno solo
+    if algoritmo in modelos_surprise.CONSTRUCTORES:
+        workers = 1
+    with ThreadPoolExecutor(workers) as pool:
+        libros = dict(zip(cant_por_lector, pool.map(libros_de, cant_por_lector)))
+
+    archivo = os.path.dirname(__file__) + f'/data/prediction_{algoritmo}.csv'
+    with open(archivo, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerow(['id_lector', 'id_libro'])
+        posicion = Counter()
+        for id_lector in filas:
+            # si el algoritmo devolvió menos libros, el resto queda vacío
+            recomendados = libros[id_lector]
+            i = posicion[id_lector]
+            writer.writerow([id_lector, recomendados[i] if i < len(recomendados) else ''])
+            posicion[id_lector] += 1
+
+    return archivo, len(cant_por_lector)
