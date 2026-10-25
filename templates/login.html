@@ -28,6 +28,8 @@
                     <option value="baseline">Baseline (Surprise)</option>
                     <option value="knn">KNN (Surprise)</option>
                     <option value="svd">SVD (Surprise)</option>
+                    <option value="dos_torres">Dos torres (red neuronal)</option>
+                    <option value="gran_torre">Una gran torre (red neuronal)</option>
                 </select>
             </label>
             <p id="descripcion-algoritmo" class="text-xs text-neutral-500 mt-1"></p>
@@ -77,7 +79,9 @@
             random: "Una selección al azar de libros que todavía no valoraste ni viste.",
             baseline: "Estima tu valoración de cada libro con la media general más tu sesgo como lector y el sesgo del libro (BaselineOnly).",
             knn: "Estima tu valoración a partir de los 40 lectores con gustos más parecidos a los tuyos (KNNWithMeans). Si todavía no tenés suficientes valoraciones, usa Baseline.",
-            svd: "Estima tu valoración con factores latentes de lectores y libros, aprendidos por factorización de matrices (SVD)."
+            svd: "Estima tu valoración con factores latentes de lectores y libros, aprendidos por factorización de matrices (SVD).",
+            dos_torres: "Una red neuronal elige los 100 libros más afines a vos comparando tu embedding con el de cada libro, y otra red los ordena según la valoración que estima que les darías. Si todavía no tenés valoraciones, usa Baseline.",
+            gran_torre: "Una red neuronal estima tu valoración de cada libro a partir de vos, el libro, su autor, género, editorial y año de edición, y tu género y año de nacimiento. Si todavía no tenés valoraciones, usa Baseline."
         };
 
         function actualizarDescripcion() {

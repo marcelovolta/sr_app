@@ -7,6 +7,7 @@ from itertools import islice
 from datetime import datetime
 
 import modelos_surprise
+import modelos_torres
 
 
 DATABASE_FILE = os.path.dirname(__file__) + '/data/data.db'
@@ -280,24 +281,29 @@ def recomendador_vision_tunel(id_lector, N=9):
     """
     return sql_select(query, (id_lector,) * 6)
 
-def recomendador_surprise(nombre, id_lector, N=9):
-    # los N libros con mayor rating estimado por el modelo de Surprise,
-    # excluyendo los que el lector ya valoró o vio, y los que no tienen título
+def _recomendador_por_ranking(id_lector, N, ranking):
+    # los N primeros libros del ranking de un modelo (de mayor a menor rating
+    # estimado), excluyendo los que el lector ya valoró o vio, y los que no tienen título.
+    # ranking(es_candidato) devuelve los pares (id_libro, rating estimado)
     excluidos = {r['id_libro'] for r in sql_select("""
         SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0
         UNION
         SELECT id_libro FROM vistas WHERE id_lector = ?
     """, (id_lector, id_lector))}
     con_titulo = {r['id_libro'] for r in sql_select("SELECT id_libro FROM libros WHERE titulo IS NOT NULL")}
+    def es_candidato(id_libro):
+        return id_libro not in excluidos and id_libro in con_titulo
 
-    ranking = modelos_surprise.ranking(nombre, DATABASE_FILE, id_lector)
-    top = list(islice((id_libro for id_libro, _ in ranking if id_libro not in excluidos and id_libro in con_titulo), N))
+    top = list(islice((id_libro for id_libro, _ in ranking(es_candidato) if es_candidato(id_libro)), N))
     if not top:
         return []
 
     libros = sql_select(f"SELECT * FROM libros WHERE id_libro IN ({', '.join('?' * len(top))})", top)
     posicion = {id_libro: i for i, id_libro in enumerate(top)}
     return sorted(libros, key=lambda r: posicion[r['id_libro']])
+
+def recomendador_surprise(nombre, id_lector, N=9):
+    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_surprise.ranking(nombre, DATABASE_FILE, id_lector))
 
 def recomendador_baseline(id_lector, N=9):
     return recomendador_surprise('baseline', id_lector, N)
@@ -307,6 +313,15 @@ def recomendador_knn(id_lector, N=9):
 
 def recomendador_svd(id_lector, N=9):
     return recomendador_surprise('svd', id_lector, N)
+
+def recomendador_torres(nombre, id_lector, N=9):
+    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_torres.ranking(nombre, DATABASE_FILE, id_lector, es_candidato))
+
+def recomendador_dos_torres(id_lector, N=9):
+    return recomendador_torres('dos_torres', id_lector, N)
+
+def recomendador_gran_torre(id_lector, N=9):
+    return recomendador_torres('gran_torre', id_lector, N)
 
 def resetear_recientes(id_lector, fecha_limite='2026-09-01 23:59:59'):
     sql_execute("DELETE FROM vistas WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
@@ -322,6 +337,8 @@ ALGORITMOS = {
     'baseline': recomendador_baseline,
     'knn': recomendador_knn,
     'svd': recomendador_svd,
+    'dos_torres': recomendador_dos_torres,
+    'gran_torre': recomendador_gran_torre,
 }
 ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
 
@@ -348,9 +365,9 @@ def generar_predicciones(algoritmo, workers=8):
         return [r['id_libro'] for r in recomendador(id_lector, cant_por_lector[id_lector])]
 
     # cada consulta abre su propia conexión, así que se pueden correr en paralelo.
-    # Los modelos de Surprise no: calculan en Python y no en SQLite, y con varios
-    # hilos compitiendo por el GIL tardan ~13 veces más que con uno solo
-    if algoritmo in modelos_surprise.CONSTRUCTORES:
+    # Los modelos de Surprise y de torres no: calculan en Python y no en SQLite, y
+    # con varios hilos compitiendo por el GIL tardan bastante más que con uno solo
+    if algoritmo in modelos_surprise.CONSTRUCTORES or algoritmo in modelos_torres.NOMBRES:
         workers = 1
     with ThreadPoolExecutor(workers) as pool:
         libros = dict(zip(cant_por_lector, pool.map(libros_de, cant_por_lector)))
