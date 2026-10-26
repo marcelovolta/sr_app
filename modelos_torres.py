@@ -23,8 +23,9 @@ import modelos_surprise
 #   además de lector y libro usa autor, género, editorial y año de edición del
 #   libro, y género y año de nacimiento del lector. Ordena todos los libros.
 #
-# A diferencia de los notebooks, se entrena con todas las valoraciones (sin
-# separar un conjunto de test), igual que los modelos de Surprise.
+# A diferencia de los notebooks, se entrena sin separar un conjunto de test, y
+# con los mismos libros y lectores que los modelos de Surprise (los que tienen más
+# de modelos_surprise.MIN_VALORACIONES valoraciones).
 NOMBRES = ('dos_torres', 'gran_torre')
 CANDIDATOS_DOS_TORRES = 100
 RATING_MIN, RATING_MAX = 1, 10

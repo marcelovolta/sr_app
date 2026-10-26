@@ -17,15 +17,36 @@ CONSTRUCTORES = {
     'svd': lambda: sp.SVD(n_factors=500, n_epochs=20, random_state=42),
 }
 
-QUERY_INTERACCIONES = "SELECT id_lector, id_libro, rating FROM interacciones WHERE COALESCE(rating, 0) > 0"
+# Los modelos se entrenan sólo con los libros y lectores con muchas valoraciones,
+# que dan mejores resultados que entrenar con todos: los libros (de la tabla
+# libros) con más de MIN_VALORACIONES valoraciones, y los lectores (de la tabla
+# lectores) con más de MIN_VALORACIONES valoraciones de esos libros. Se recomienda
+# igual a todos los lectores: los que quedan afuera reciben el ranking de Baseline
+MIN_VALORACIONES = 35
 
-# como en el notebook, KNN se entrena sólo con lectores y libros con más de 20
-# valoraciones: con todos los lectores la matriz de similitud ocupa ~1 GB
-QUERY_INTERACCIONES_KNN = """
+QUERY_INTERACCIONES = f"""
+    WITH libros_entrenamiento AS (
+        SELECT id_libro FROM interacciones
+        WHERE id_libro IN (SELECT id_libro FROM libros)
+        GROUP BY id_libro HAVING COUNT(*) > {MIN_VALORACIONES}
+    ),
+    lectores_entrenamiento AS (
+        SELECT id_lector FROM interacciones
+        WHERE id_libro IN libros_entrenamiento AND id_lector IN (SELECT id_lector FROM lectores)
+        GROUP BY id_lector HAVING COUNT(*) > {MIN_VALORACIONES}
+    )
     SELECT id_lector, id_libro, rating FROM interacciones
     WHERE COALESCE(rating, 0) > 0
-    AND id_libro IN (SELECT id_libro FROM interacciones GROUP BY 1 HAVING COUNT(*) > 20)
-    AND id_lector IN (SELECT id_lector FROM interacciones GROUP BY 1 HAVING COUNT(*) > 20)
+    AND id_libro IN libros_entrenamiento AND id_lector IN lectores_entrenamiento
+"""
+
+# como en el notebook, KNN además se queda sólo con los lectores y libros con más
+# de 20 valoraciones dentro de ese conjunto
+QUERY_INTERACCIONES_KNN = f"""
+    WITH entrenamiento AS ({QUERY_INTERACCIONES})
+    SELECT * FROM entrenamiento
+    WHERE id_libro IN (SELECT id_libro FROM entrenamiento GROUP BY 1 HAVING COUNT(*) > 20)
+    AND id_lector IN (SELECT id_lector FROM entrenamiento GROUP BY 1 HAVING COUNT(*) > 20)
 """
 
 # los modelos entrenados se guardan con pickle en esta carpeta, uno por algoritmo
