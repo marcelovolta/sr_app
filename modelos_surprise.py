@@ -22,7 +22,7 @@ CONSTRUCTORES = {
 # libros) con más de MIN_VALORACIONES valoraciones, y los lectores (de la tabla
 # lectores) con más de MIN_VALORACIONES valoraciones de esos libros. Se recomienda
 # igual a todos los lectores: los que quedan afuera reciben el ranking de Baseline
-MIN_VALORACIONES = 35
+MIN_VALORACIONES = 20
 
 QUERY_INTERACCIONES = f"""
     WITH libros_entrenamiento AS (
@@ -93,6 +93,15 @@ def modelo(nombre, database_file):
         if nombre not in _modelos:
             _modelos[nombre] = _cargar_o_entrenar(nombre, database_file)
         return _modelos[nombre]
+
+
+def conoce_lector(nombre, database_file, id_lector):
+    # False si el lector no estaba al entrenar
+    try:
+        modelo(nombre, database_file).trainset.to_inner_uid(id_lector)
+    except ValueError:
+        return False
+    return True
 
 
 def _estimaciones(nombre, algo, id_lector):

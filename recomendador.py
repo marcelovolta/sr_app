@@ -11,10 +11,17 @@ import modelos_torres
 
 
 DATABASE_FILE = os.path.dirname(__file__) + '/data/data.db'
+# los modelos de Surprise y de torres se entrenan con esta versión reducida de la
+# base (salvo dos_torres_v2_completa); todo lo demás (top_n, visión de túnel, los
+# libros ya vistos) usa la completa
+DATABASE_ENTRENAMIENTO_FILE = os.path.dirname(__file__) + '/data/backup/data_filtrada_min35.db'
 PREDICCION_BASE_FILE = os.path.dirname(__file__) + '/data/prediction_base.csv'
+CASCADA_ARRANQUE_FRIO = 2
+CASCADA_POCAS = 10
+CASCADA_V2_MAX_VISION_TUNEL = 35  # la base reducida sólo tiene lectores con más de 35 interacciones
 
-def sql_select(query, params=()):
-    conn = sqlite3.connect(DATABASE_FILE)
+def sql_select(query, params=(), database_file=DATABASE_FILE):
+    conn = sqlite3.connect(database_file)
     conn.row_factory = sqlite3.Row # esto es para que devuelva regisros en el fetchall
     cur = conn.cursor()
     
@@ -303,7 +310,7 @@ def _recomendador_por_ranking(id_lector, N, ranking):
     return sorted(libros, key=lambda r: posicion[r['id_libro']])
 
 def recomendador_surprise(nombre, id_lector, N=9):
-    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_surprise.ranking(nombre, DATABASE_FILE, id_lector))
+    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_surprise.ranking(nombre, DATABASE_ENTRENAMIENTO_FILE, id_lector))
 
 def recomendador_baseline(id_lector, N=9):
     return recomendador_surprise('baseline', id_lector, N)
@@ -314,14 +321,66 @@ def recomendador_knn(id_lector, N=9):
 def recomendador_svd(id_lector, N=9):
     return recomendador_surprise('svd', id_lector, N)
 
-def recomendador_torres(nombre, id_lector, N=9):
-    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_torres.ranking(nombre, DATABASE_FILE, id_lector, es_candidato))
+def recomendador_torres(nombre, id_lector, N=9, database_file=DATABASE_ENTRENAMIENTO_FILE):
+    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_torres.ranking(nombre, database_file, id_lector, es_candidato))
 
 def recomendador_dos_torres(id_lector, N=9):
     return recomendador_torres('dos_torres', id_lector, N)
 
+def recomendador_dos_torres_v2(id_lector, N=9):
+    return recomendador_torres('dos_torres_v2', id_lector, N)
+
+def recomendador_dos_torres_v2_completa(id_lector, N=9):
+    return recomendador_torres('dos_torres_v2_completa', id_lector, N, DATABASE_FILE)
+
 def recomendador_gran_torre(id_lector, N=9):
     return recomendador_torres('gran_torre', id_lector, N)
+
+def recomendador_gran_torre_v2(id_lector, N=9):
+    return recomendador_torres('gran_torre_v2', id_lector, N)
+
+def cant_interacciones(id_lector, database_file=DATABASE_FILE):
+    query = "SELECT COUNT(*) AS cant FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0"
+    return sql_select(query, (id_lector,), database_file)[0]['cant']
+
+def recomendador_cascada_v1(id_lector, N=9):
+    # no usa la base reducida: elige el algoritmo según las interacciones del lector
+    # en la base completa. Arranque en frío (hasta CASCADA_ARRANQUE_FRIO) con los mejor
+    # valorados, pocas (hasta CASCADA_POCAS) con visión de túnel, y el resto con dos
+    # torres. Los lectores con muchas interacciones que quedaron afuera del modelo
+    # (casi todas son de libros con pocas valoraciones) también van a visión de túnel
+    cant = cant_interacciones(id_lector)
+    if cant <= CASCADA_ARRANQUE_FRIO:
+        return recomendador_top_n(id_lector, N)
+    if cant <= CASCADA_POCAS or not modelos_torres.conoce_lector('dos_torres_v2_completa', DATABASE_FILE, id_lector):
+        return recomendador_vision_tunel(id_lector, N)
+    return recomendador_dos_torres_v2_completa(id_lector, N)
+
+def _cascada_base_reducida(recomendador_modelo, conoce_lector, id_lector, N):
+    # elige el algoritmo según las interacciones del lector en la base completa:
+    # arranque en frío (hasta CASCADA_ARRANQUE_FRIO) con los mejor valorados, hasta
+    # CASCADA_V2_MAX_VISION_TUNEL con visión de túnel, y el resto con recomendador_modelo,
+    # entrenado con la base reducida. Los que no entraron en esa base no están en el
+    # modelo (muchas de sus interacciones son de libros poco valorados), y también
+    # van a visión de túnel
+    cant = cant_interacciones(id_lector)
+    if cant <= CASCADA_ARRANQUE_FRIO:
+        return recomendador_top_n(id_lector, N)
+    if cant <= CASCADA_V2_MAX_VISION_TUNEL or not conoce_lector(id_lector):
+        return recomendador_vision_tunel(id_lector, N)
+    return recomendador_modelo(id_lector, N)
+
+def recomendador_cascada_v2(id_lector, N=9):
+    conoce = lambda id_lector: modelos_torres.conoce_lector('dos_torres_v2', DATABASE_ENTRENAMIENTO_FILE, id_lector)
+    return _cascada_base_reducida(recomendador_dos_torres_v2, conoce, id_lector, N)
+
+def recomendador_cascada_v3(id_lector, N=9):
+    conoce = lambda id_lector: modelos_torres.conoce_lector('gran_torre_v2', DATABASE_ENTRENAMIENTO_FILE, id_lector)
+    return _cascada_base_reducida(recomendador_gran_torre_v2, conoce, id_lector, N)
+
+def recomendador_cascada_v4(id_lector, N=9):
+    conoce = lambda id_lector: modelos_surprise.conoce_lector('svd', DATABASE_ENTRENAMIENTO_FILE, id_lector)
+    return _cascada_base_reducida(recomendador_svd, conoce, id_lector, N)
 
 def resetear_recientes(id_lector, fecha_limite='2026-09-01 23:59:59'):
     sql_execute("DELETE FROM vistas WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
@@ -338,7 +397,13 @@ ALGORITMOS = {
     'knn': recomendador_knn,
     'svd': recomendador_svd,
     'dos_torres': recomendador_dos_torres,
+    'dos_torres_v2': recomendador_dos_torres_v2,
     'gran_torre': recomendador_gran_torre,
+    'gran_torre_v2': recomendador_gran_torre_v2,
+    'cascada_v1': recomendador_cascada_v1,
+    'cascada_v2': recomendador_cascada_v2,
+    'cascada_v3': recomendador_cascada_v3,
+    'cascada_v4': recomendador_cascada_v4,
 }
 ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
 
@@ -366,8 +431,9 @@ def generar_predicciones(algoritmo, workers=8):
 
     # cada consulta abre su propia conexión, así que se pueden correr en paralelo.
     # Los modelos de Surprise y de torres no: calculan en Python y no en SQLite, y
-    # con varios hilos compitiendo por el GIL tardan bastante más que con uno solo
-    if algoritmo in modelos_surprise.CONSTRUCTORES or algoritmo in modelos_torres.NOMBRES:
+    # con varios hilos compitiendo por el GIL tardan bastante más que con uno solo.
+    # Las cascadas usan dos torres con la mayoría de los lectores
+    if algoritmo in modelos_surprise.CONSTRUCTORES or algoritmo in modelos_torres.NOMBRES or algoritmo.startswith('cascada'):
         workers = 1
     with ThreadPoolExecutor(workers) as pool:
         libros = dict(zip(cant_por_lector, pool.map(libros_de, cant_por_lector)))
