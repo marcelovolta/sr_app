@@ -5,10 +5,12 @@ app = Flask(__name__)
 
 @app.get('/')
 def get_index():
+    # pantalla de ingreso: lector y algoritmo
     return render_template('login.html')
 
 @app.post('/')
 def post_index():
+    # recibe el lector y el algoritmo elegidos y va a sus recomendaciones
     id_lector = request.form.get('id_lector')
     algoritmo = request.form.get('algoritmo', recomendador.ALGORITMO_POR_DEFECTO)
     if not id_lector:
@@ -19,12 +21,14 @@ def post_index():
 
 @app.get('/reset/<id_lector>/<algoritmo>')
 def get_reset(id_lector, algoritmo):
+    # borra lo que el lector vio y valoró en la app, y vuelve a recomendar
     recomendador.resetear_recientes(id_lector)
     return redirect(f'/recomendar/{id_lector}/{algoritmo}')
 
 
 @app.get('/recomendar/<id_lector>/<algoritmo>')
 def get_recomendar(id_lector, algoritmo):
+    # muestra las recomendaciones (y las registra como vistas)
     libros_recomendados = recomendador.recomendar(id_lector, algoritmo)
     cant_vistos = recomendador.items_vistos(id_lector)[0]['items_vistos']
     cant_valorados = recomendador.item_valorados(id_lector)[0]['item_valorados']

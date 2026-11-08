@@ -25,19 +25,18 @@
                     <option value="top_n">Mejor valorados</option>
                     <option value="mas_valorados">Más valorados</option>
                     <option value="random">Aleatorio</option>
-                    <option value="baseline">Baseline (Surprise)</option>
-                    <option value="knn">KNN (Surprise)</option>
+                    <option value="naive">Naive (Baseline de Surprise)</option>
                     <option value="svd">SVD (Surprise)</option>
-                    <option value="dos_torres">Dos torres (red neuronal)</option>
-                    <option value="dos_torres_v2">Dos torres v2 (red neuronal con negativos)</option>
-                    <option value="gran_torre">Una gran torre (red neuronal)</option>
-                    <option value="gran_torre_v2">Una gran torre v2 (red neuronal con negativos)</option>
                     <option value="ease">EASE (autoencoder lineal)</option>
-                    <option value="cascada_v1">Cascada v1 (según tus valoraciones)</option>
-                    <option value="cascada_v2">Cascada v2 (según tus valoraciones, modelo reducido)</option>
-                    <option value="cascada_v3">Cascada v3 (según tus valoraciones, gran torre)</option>
-                    <option value="cascada_v4">Cascada v4 (según tus valoraciones, SVD)</option>
-                    <option value="cascada_v5">Cascada v5 (según tus valoraciones, EASE)</option>
+                    <option value="dos_torres">Dos torres (red neuronal)</option>
+                    <option value="gran_torre">Una gran torre (red neuronal)</option>
+                    <option value="cascada_naive">Cascada naive</option>
+                    <option value="cascada_svd">Cascada SVD</option>
+                    <option value="cascada_ease">Cascada EASE</option>
+                    <option value="cascada_dos_torres">Cascada dos torres</option>
+                    <option value="cascada_gran_torre">Cascada gran torre</option>
+                    <option value="ensamble">Ensamble (LightGBM)</option>
+                    <option value="cascada_ensamble">Cascada ensamble</option>
                 </select>
             </label>
             <p id="descripcion-algoritmo" class="text-xs text-neutral-500 mt-1"></p>
@@ -85,19 +84,18 @@
             top_n: "Los libros con mejor valoración promedio (con al menos 5 valoraciones) que todavía no valoraste ni viste.",
             mas_valorados: "Los libros con más valoraciones que todavía no valoraste ni viste.",
             random: "Una selección al azar de libros que todavía no valoraste ni viste.",
-            baseline: "Estima tu valoración de cada libro con la media general más tu sesgo como lector y el sesgo del libro (BaselineOnly).",
-            knn: "Estima tu valoración a partir de los 40 lectores con gustos más parecidos a los tuyos (KNNWithMeans). Si todavía no tenés suficientes valoraciones, usa Baseline.",
+            naive: "Ordena los libros por su sesgo: cuánto mejor o peor los valoran todos respecto de la media (BaselineOnly). Es igual para todos los lectores.",
             svd: "Estima tu valoración con factores latentes de lectores y libros, aprendidos por factorización de matrices (SVD).",
-            dos_torres: "Una red neuronal elige los 100 libros más afines a vos comparando tu embedding con el de cada libro, y otra red los ordena según la valoración que estima que les darías. Si todavía no tenés valoraciones, usa Baseline.",
-            dos_torres_v2: "Una red neuronal aprende qué libros elegís frente a los que no elegís, y te recomienda los más afines a vos comparando tu embedding con el de cada libro. Si todavía no tenés valoraciones, usa Baseline.",
-            gran_torre: "Una red neuronal estima tu valoración de cada libro a partir de vos, el libro, su autor, género, editorial y año de edición, y tu género y año de nacimiento. Si todavía no tenés valoraciones, usa Baseline.",
-            gran_torre_v2: "Una red neuronal estima la probabilidad de que elijas cada libro, a partir de vos, el libro, su autor, género, editorial y año de edición, y tu género y año de nacimiento. Aprende comparando los libros que elegiste con otros al azar. Si todavía no tenés valoraciones, usa Baseline.",
-            ease: "Un modelo lineal aprende cuánto suma cada libro que leíste a favor de cada otro libro, y te recomienda los que más puntaje acumulan con tus lecturas (EASE). Si todavía no tenés valoraciones, usa Baseline.",
-            cascada_v1: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; con hasta 10, visión de túnel; con más de 10, dos torres v2, o visión de túnel si casi todas tus valoraciones son de libros poco valorados.",
-            cascada_v2: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; con hasta 35, visión de túnel; con más de 35, dos torres v2, o visión de túnel si muchas de tus valoraciones son de libros poco valorados.",
-            cascada_v3: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; con hasta 35, visión de túnel; con más de 35, una gran torre v2, o visión de túnel si muchas de tus valoraciones son de libros poco valorados.",
-            cascada_v4: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; con hasta 35, visión de túnel; con más de 35, SVD, o visión de túnel si muchas de tus valoraciones son de libros poco valorados.",
-            cascada_v5: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; con hasta 35, visión de túnel; con más de 35, EASE, o visión de túnel si muchas de tus valoraciones son de libros poco valorados."
+            ease: "Un modelo lineal aprende cuánto suma cada libro que leíste a favor de cada otro libro, y te recomienda los que más puntaje acumulan con tus lecturas (EASE).",
+            dos_torres: "Una red neuronal aprende qué libros elegís frente a los que no elegís, y te recomienda los más afines comparando tu embedding con el de cada libro.",
+            gran_torre: "Una red neuronal estima la probabilidad de que elijas cada libro, a partir de vos, el libro, su autor, género, editorial y año de edición, y tu género y año de nacimiento.",
+            cascada_naive: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, naive.",
+            cascada_svd: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, SVD.",
+            cascada_ease: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, EASE.",
+            cascada_dos_torres: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, dos torres.",
+            cascada_gran_torre: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, una gran torre.",
+            ensamble: "Combina SVD, EASE, dos torres y gran torre: un modelo LightGBM reordena los libros que propone cada uno según el puntaje y la posición que le dan.",
+            cascada_ensamble: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si ningún modelo te conoce todavía, visión de túnel; si no, el ensamble de modelos."
         };
 
         function actualizarDescripcion() {

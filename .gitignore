@@ -7,3 +7,7 @@ data/*.db-journal
 
 # modelos de Surprise entrenados (se regeneran si no están)
 modelos/
+
+# copia de trabajo de la base, estudios de Optuna y logs del pipeline
+data/trabajo/
+data/backup/

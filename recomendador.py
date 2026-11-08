@@ -5,24 +5,28 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from datetime import datetime
+import threading
 
-import modelos_surprise
-import modelos_torres
-import modelos_ease
+import ensamble
+import modelos
 
 
-DATABASE_FILE = os.path.dirname(__file__) + '/data/data.db'
-# los modelos de Surprise y de torres se entrenan con esta versión reducida de la
-# base (salvo dos_torres_v2_completa); todo lo demás (top_n, visión de túnel, los
-# libros ya vistos) usa la completa
-DATABASE_ENTRENAMIENTO_FILE = os.path.dirname(__file__) + '/data/backup/data_filtrada_min35.db'
-PREDICCION_BASE_FILE = os.path.dirname(__file__) + '/data/prediction_base.csv'
-CASCADA_ARRANQUE_FRIO = 2
-CASCADA_POCAS = 10
-CASCADA_V2_MAX_VISION_TUNEL = 35  # la base reducida sólo tiene lectores con más de 35 interacciones
+# Base que usan los algoritmos. La app usa la base real; pipeline.py la cambia
+# por su copia de trabajo (set_base) para generar las predicciones.
+DATABASE_FILE = os.path.dirname(os.path.abspath(__file__)) + '/data/data.db'
+PREDICCION_BASE_FILE = os.path.dirname(os.path.abspath(__file__)) + '/data/prediction_base.csv'
+CASCADA_ARRANQUE_FRIO = 2  # hasta estas valoraciones, el lector recibe top_n
 
-def sql_select(query, params=(), database_file=DATABASE_FILE):
-    conn = sqlite3.connect(database_file)
+
+def set_base(database_file):
+    # cambia la base que usan todos los algoritmos (pipeline.py usa su copia)
+    global DATABASE_FILE
+    DATABASE_FILE = database_file
+
+
+def sql_select(query, params=(), database_file=None):
+    # ejecuta una consulta y devuelve sus filas (accesibles por nombre de columna)
+    conn = sqlite3.connect(database_file or DATABASE_FILE)
     conn.row_factory = sqlite3.Row # esto es para que devuelva regisros en el fetchall
     cur = conn.cursor()
     
@@ -35,6 +39,7 @@ def sql_select(query, params=(), database_file=DATABASE_FILE):
 
 
 def sql_execute(query, params=()):
+    # ejecuta una sentencia que modifica la base
     conn = sqlite3.connect(DATABASE_FILE)
     cur = conn.cursor()
     
@@ -46,6 +51,7 @@ def sql_execute(query, params=()):
 
 
 def item_valorados(id_lector):
+    # cantidad de libros que el lector valoró (para mostrar en la app)
     query = """
         SELECT COUNT(*) AS item_valorados 
         FROM libros 
@@ -58,6 +64,7 @@ def item_valorados(id_lector):
 
 
 def items_vistos(id_lector):
+    # cantidad de libros que se le mostraron al lector (para mostrar en la app)
     query = """
         SELECT COUNT(*) AS items_vistos 
         FROM libros 
@@ -66,18 +73,8 @@ def items_vistos(id_lector):
     """
     return sql_select(query, (id_lector,))
 
-def items_desconocidos(id_lector):
-    query = """
-        SELECT * AS items_desconocidos 
-        FROM libros 
-        WHERE id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ?)
-        AND id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        AND titulo IS NOT NULL
-    """
-    return sql_select(query, (id_lector, id_lector))
-
-
 def insertar_vistos(id_lector, libros):
+    # registra los libros mostrados al lector, para no volver a recomendárselos
     query="""
         INSERT INTO vistas (id_lector, id_libro, fecha) VALUES (?, ?, ?) ON CONFLICT DO NOTHING
     """
@@ -87,6 +84,7 @@ def insertar_vistos(id_lector, libros):
 
 
 def insertar_valorado(id_lector, id_libro, rating):
+    # guarda la valoración que el lector hizo en la app
     # TODO: permitir que el lector actualice una valoración ya existente
     # (hoy ON CONFLICT DO NOTHING ignora la nueva puntuación en silencio)
     fecha = datetime.now()
@@ -97,6 +95,7 @@ def insertar_valorado(id_lector, id_libro, rating):
 
 
 def recomendador_random(id_lector, N=9):
+    # N libros al azar que el lector no valoró ni vio
     query = f"""
         SELECT * 
         FROM libros 
@@ -108,289 +107,194 @@ def recomendador_random(id_lector, N=9):
     """
     return sql_select(query, (id_lector, id_lector))  
 
+# ---------------------------------------------------------------------------
+# Algoritmos basados en SQL
+#
+# Optimización: antes cada uno era una única consulta por lector que, además de
+# lo propio del lector, recalculaba sobre toda la tabla de interacciones un
+# ranking global que es igual para todos (promedio o cantidad de valoraciones
+# por libro). Con 832 lectores eso eran 832 agregaciones de ~1 s, y en paralelo
+# los hilos se trababan entre sí (top_n tardaba ~25 min).
+# Ahora la parte global se calcula una vez y queda en memoria (_global), y por
+# lector sólo se consulta lo suyo (sus géneros y autores, con el índice de
+# interacciones) y se recorre el ranking en Python salteando lo que ya leyó o
+# vio (_recomendador_por_ranking). Los resultados son los mismos que con las
+# consultas originales; los empates se desempatan por id_libro.
+# ---------------------------------------------------------------------------
+
+_cache = {}
+_cache_lock = threading.RLock()  # reentrante: un cálculo global puede pedir otro
+
+
+def _global(nombre, calcular):
+    # Resultado de calcular() guardado por base y por fecha de modificación del
+    # archivo: si la base cambia (por ejemplo, la app guarda una valoración) se
+    # recalcula en la próxima consulta, así nunca se usa un ranking desactualizado
+    base = DATABASE_FILE
+    clave = (nombre, base, os.stat(base).st_mtime_ns)
+    with _cache_lock:
+        if clave not in _cache:
+            for vieja in [c for c in _cache if c[:2] == clave[:2]]:
+                del _cache[vieja]
+            _cache[clave] = calcular()
+        return _cache[clave]
+
+
+def _estadisticas_libros():
+    # por libro: valoraciones (COUNT), promedio (AVG) y rating corregido
+    # 0.8 * promedio + 0.2 * valoraciones, igual que en las consultas originales
+    filas = sql_select("SELECT id_libro, COUNT(*) AS cant, AVG(rating) AS promedio FROM interacciones GROUP BY id_libro")
+    return {r['id_libro']: (r['cant'], r['promedio'], (0.8 * r['promedio']) + (0.2 * r['cant'])) for r in filas}
+
+
+def _libros():
+    # por libro de la tabla libros: (género, autor, tiene título)
+    return {r['id_libro']: (r['genero'], r['autor'], r['titulo'] is not None)
+            for r in sql_select("SELECT id_libro, genero, autor, titulo FROM libros")}
+
+
+def _ordenar(puntajes):
+    # ids de mayor a menor puntaje, desempatando por id_libro
+    return [b for b, _ in sorted(puntajes.items(), key=lambda x: (-x[1], x[0]))]
+
+
 def recomendador_top_n(id_lector, N=9):
-    # se exige un mínimo de 5 valoraciones para que un único 10 no domine el ranking
-    query = f"""
-        WITH t1 AS (
-        SELECT li.id_libro, AVG(i.rating) AS promedio_rating 
-        FROM libros AS li
-        INNER JOIN interacciones AS i ON li.id_libro = i.id_libro
-        WHERE li.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
-        AND li.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        AND li.titulo IS NOT NULL
-        GROUP BY li.id_libro
-        HAVING COUNT(*) >= 5
-        ORDER BY promedio_rating DESC
-        LIMIT {N}
-    )
-    SELECT libros.* FROM libros
-    INNER JOIN t1 ON t1.id_libro = libros.id_libro
-    ORDER BY t1.promedio_rating DESC
-    """
-    return sql_select(query, (id_lector, id_lector))
+    # mejor promedio, con un mínimo de 5 valoraciones para que un único 10 no domine
+    def calcular():
+        # ranking global (igual para todos los lectores)
+        libros, est = _global('libros', _libros), _global('estadisticas', _estadisticas_libros)
+        return _ordenar({b: prom for b, (cant, prom, _) in est.items() if cant >= 5 and b in libros})
+    return _recomendador_por_ranking(id_lector, N, _global('top_n', calcular))
+
 
 def recomendador_mas_valorados(id_lector, N=9):
-    query = f"""
-        WITH t1 AS (
-        SELECT li.id_libro, COUNT(*) AS valoraciones 
-        FROM libros AS li
-        INNER JOIN interacciones AS i ON li.id_libro = i.id_libro
-        WHERE li.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
-        AND li.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        AND li.titulo IS NOT NULL
-        GROUP BY li.id_libro
-        ORDER BY valoraciones DESC
-        LIMIT {N}
-    )
-    SELECT libros.* FROM libros
-    INNER JOIN t1 ON t1.id_libro = libros.id_libro
-    ORDER BY t1.valoraciones DESC
-    """
-    return sql_select(query, (id_lector, id_lector))
+    # los libros con más valoraciones
+    def calcular():
+        # ranking global (igual para todos los lectores)
+        libros, est = _global('libros', _libros), _global('estadisticas', _estadisticas_libros)
+        return _ordenar({b: cant for b, (cant, _, _) in est.items() if b in libros})
+    return _recomendador_por_ranking(id_lector, N, _global('mas_valorados', calcular))
+
+
+def _preferencias(id_lector, campo, minimo):
+    # rating corregido de cada género o autor que el lector valoró al menos `minimo` veces
+    # (campo es 'genero' o 'autor', no viene del usuario)
+    filas = sql_select(f"""
+        SELECT li.{campo} AS valor, COUNT(*) AS cant, AVG(i.rating) AS promedio
+        FROM interacciones AS i
+        INNER JOIN libros AS li ON li.id_libro = i.id_libro
+        WHERE i.id_lector = ? AND COALESCE(i.rating, 0) > 0 AND li.{campo} IS NOT NULL
+        GROUP BY li.{campo}
+        HAVING COUNT(*) >= ?
+    """, (id_lector, minimo))
+    return {r['valor']: (0.8 * r['promedio']) + (0.2 * r['cant']) for r in filas}
+
 
 def recomendador_perfil_balanceado(id_lector, N=9):
-    # combina los géneros y autores que el lector valoró (al menos 3 veces)
-    # con la valoración general de cada libro popular (más de 5 valoraciones)
-    query = f"""
-    WITH generos_pref AS (
-        SELECT
-            li.genero,
-            AVG(i.rating) AS promedio_rating,
-            COUNT(*) AS cant_valoraciones,
-            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_genero
-        FROM interacciones AS i
-        INNER JOIN libros AS li ON li.id_libro = i.id_libro
-        WHERE i.id_lector = ?
-        AND COALESCE(i.rating, 0) > 0
-        AND li.genero IS NOT NULL
-        GROUP BY li.genero
-        HAVING COUNT(*) > 2  -- hiperparámetro
-    ),
+    # combina los géneros y autores que el lector valoró (al menos 3 veces) con la
+    # valoración general de cada libro popular (más de 5 valoraciones):
+    # 0.4 * género + 0.4 * autor + 0.2 * rating corregido del libro
+    generos = _preferencias(id_lector, 'genero', 3)   # hiperparámetro
+    autores = _preferencias(id_lector, 'autor', 3)    # hiperparámetro
 
-    autores_pref AS (
-        SELECT
-            li.autor,
-            AVG(i.rating) AS promedio_rating,
-            COUNT(*) AS cant_valoraciones,
-            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_autor
-        FROM interacciones AS i
-        INNER JOIN libros AS li ON li.id_libro = i.id_libro
-        WHERE i.id_lector = ?
-        AND COALESCE(i.rating, 0) > 0
-        AND li.autor IS NOT NULL
-        GROUP BY li.autor
-        HAVING COUNT(*) > 2  -- hiperparámetro
-    ),
+    def calcular():
+        # los libros populares con su género, autor y rating corregido
+        libros, est = _global('libros', _libros), _global('estadisticas', _estadisticas_libros)
+        return [(b, libros[b][0], libros[b][1], rc) for b, (cant, _, rc) in est.items() if cant > 5 and b in libros]
 
-    libros_populares AS (
-        SELECT
-            id_libro,
-            AVG(rating) AS promedio_rating,
-            COUNT(*) AS cant_valoraciones,
-            (0.8 * AVG(rating)) + (0.2 * COUNT(*)) AS rating_corr
-        FROM interacciones
-        GROUP BY id_libro
-        HAVING COUNT(*) > 5
-    ),
+    puntajes = {b: (0.4 * generos.get(g, 0)) + (0.4 * autores.get(a, 0)) + (0.2 * rc)
+                for b, g, a, rc in _global('populares_perfil', calcular)}
+    return _recomendador_por_ranking(id_lector, N, _ordenar(puntajes))
 
-    seleccion_final AS (
-        SELECT
-            lp.id_libro,
-            (0.4 * COALESCE(gp.rating_corr_genero, 0))
-              + (0.4 * COALESCE(ap.rating_corr_autor, 0))
-              + (0.2 * lp.rating_corr) AS rating_global
-        FROM libros_populares AS lp
-        INNER JOIN libros AS li ON li.id_libro = lp.id_libro
-        LEFT JOIN generos_pref AS gp ON gp.genero = li.genero
-        LEFT JOIN autores_pref AS ap ON ap.autor = li.autor
-        WHERE lp.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
-        AND lp.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        AND li.titulo IS NOT NULL
-        ORDER BY rating_global DESC, lp.id_libro
-        LIMIT {N}
-    )
-    SELECT libros.* FROM libros
-    INNER JOIN seleccion_final AS sf ON sf.id_libro = libros.id_libro
-    ORDER BY sf.rating_global DESC, sf.id_libro
-    """
-    return sql_select(query, (id_lector,) * 4)
 
 def recomendador_vision_tunel(id_lector, N=9):
-    # más estricto que perfil_balanceado: el libro tiene que coincidir en género
-    # Y en autor con los favoritos del lector; si no alcanzan N, se completa
-    # con libros populares (orden = 1)
-    query = f"""
-    WITH generos_fav AS (
-        SELECT
-            li.genero,
-            COUNT(*) AS cant_genero,
-            AVG(i.rating) AS promedio_rating,
-            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_genero
-        FROM interacciones AS i
-        INNER JOIN libros AS li ON li.id_libro = i.id_libro
-        WHERE i.id_lector = ?
-        AND COALESCE(i.rating, 0) > 0
-        AND li.genero IS NOT NULL
-        GROUP BY li.genero
-    ),
+    # más estricto que perfil_balanceado: el libro tiene que coincidir en género Y
+    # en autor con los que valoró el lector (puntaje = autor + género); si no
+    # alcanzan N, se completa con los populares (más de 5 valoraciones)
+    generos = _preferencias(id_lector, 'genero', 1)
+    autores = _preferencias(id_lector, 'autor', 1)
 
-    autores_fav AS (
-        SELECT
-            li.autor,
-            COUNT(*) AS cant_autor,
-            AVG(i.rating) AS promedio_rating,
-            (0.8 * AVG(i.rating)) + (0.2 * COUNT(*)) AS rating_corr_autor
-        FROM interacciones AS i
-        INNER JOIN libros AS li ON li.id_libro = i.id_libro
-        WHERE i.id_lector = ?
-        AND COALESCE(i.rating, 0) > 0
-        AND li.autor IS NOT NULL
-        GROUP BY li.autor
-    ),
+    def por_genero_y_autor():
+        # índice (género, autor) -> libros, para encontrar rápido los afines
+        indice = {}
+        for b, (g, a, _) in _global('libros', _libros).items():
+            indice.setdefault((g, a), []).append(b)
+        return indice
 
-    vision_tunel AS (
-        SELECT
-            li.id_libro,
-            af.rating_corr_autor + gf.rating_corr_genero AS rating_final,
-            0 AS orden
-        FROM libros AS li
-        INNER JOIN generos_fav AS gf ON gf.genero = li.genero
-        INNER JOIN autores_fav AS af ON af.autor = li.autor
-        WHERE li.id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
-        AND li.id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        AND li.titulo IS NOT NULL
-    ),
+    def populares():
+        # los populares (más de 5 valoraciones) por rating corregido
+        return _ordenar({b: rc for b, (cant, _, rc) in _global('estadisticas', _estadisticas_libros).items() if cant > 5})
 
-    -- se excluyen explícitamente los libros de vision_tunel para que un libro
-    -- que califica en ambos niveles no aparezca dos veces
-    libros_populares AS (
-        SELECT
-            id_libro,
-            (0.8 * AVG(rating)) + (0.2 * COUNT(*)) AS rating_corr,
-            1 AS orden
-        FROM interacciones
-        WHERE id_libro NOT IN (SELECT id_libro FROM vision_tunel)
-        AND id_libro NOT IN (SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0)
-        AND id_libro NOT IN (SELECT id_libro FROM vistas WHERE id_lector = ?)
-        GROUP BY id_libro
-        HAVING COUNT(*) > 5
-    ),
+    indice = _global('libros_por_genero_y_autor', por_genero_y_autor)
+    afines = {b: autores[a] + generos[g] for a in autores for g in generos for b in indice.get((g, a), ())}
+    ranking = _ordenar(afines) + [b for b in _global('populares_tunel', populares) if b not in afines]
+    return _recomendador_por_ranking(id_lector, N, ranking)
 
-    preseleccion AS (
-        SELECT id_libro, rating_final, orden FROM vision_tunel
-        UNION ALL
-        SELECT id_libro, rating_corr AS rating_final, orden FROM libros_populares
-    )
-    SELECT libros.* FROM preseleccion AS ps
-    INNER JOIN libros ON libros.id_libro = ps.id_libro
-    WHERE libros.titulo IS NOT NULL
-    ORDER BY ps.orden ASC, ps.rating_final DESC, ps.id_libro
-    LIMIT {N}
-    """
-    return sql_select(query, (id_lector,) * 6)
 
 def _recomendador_por_ranking(id_lector, N, ranking):
-    # los N primeros libros del ranking de un modelo (de mayor a menor rating
-    # estimado), excluyendo los que el lector ya valoró o vio, y los que no tienen título.
-    # ranking(es_candidato) devuelve los pares (id_libro, rating estimado)
+    # los N primeros libros de un ranking (ids, o pares id_libro, puntaje), sin
+    # los que el lector ya valoró o vio ni los que no tienen título
     excluidos = {r['id_libro'] for r in sql_select("""
         SELECT id_libro FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0
         UNION
         SELECT id_libro FROM vistas WHERE id_lector = ?
     """, (id_lector, id_lector))}
-    con_titulo = {r['id_libro'] for r in sql_select("SELECT id_libro FROM libros WHERE titulo IS NOT NULL")}
-    def es_candidato(id_libro):
-        return id_libro not in excluidos and id_libro in con_titulo
+    libros = _global('libros', _libros)
 
-    top = list(islice((id_libro for id_libro, _ in ranking(es_candidato) if es_candidato(id_libro)), N))
+    ids = (x if isinstance(x, str) else x[0] for x in ranking)
+    top = list(islice((b for b in ids if b not in excluidos and b in libros and libros[b][2]), N))
     if not top:
         return []
-
-    libros = sql_select(f"SELECT * FROM libros WHERE id_libro IN ({', '.join('?' * len(top))})", top)
+    filas = sql_select(f"SELECT * FROM libros WHERE id_libro IN ({', '.join('?' * len(top))})", top)
     posicion = {id_libro: i for i, id_libro in enumerate(top)}
-    return sorted(libros, key=lambda r: posicion[r['id_libro']])
+    return sorted(filas, key=lambda r: posicion[r['id_libro']])
 
-def recomendador_surprise(nombre, id_lector, N=9):
-    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_surprise.ranking(nombre, DATABASE_ENTRENAMIENTO_FILE, id_lector))
 
-def recomendador_baseline(id_lector, N=9):
-    return recomendador_surprise('baseline', id_lector, N)
+NOMBRES_MODELOS = (*modelos.NOMBRES, 'ensamble')
 
-def recomendador_knn(id_lector, N=9):
-    return recomendador_surprise('knn', id_lector, N)
 
-def recomendador_svd(id_lector, N=9):
-    return recomendador_surprise('svd', id_lector, N)
+def _ranking(nombre, id_lector):
+    # ranking de un modelo entrenado; el ensamble vive en su propio módulo
+    return ensamble.ranking(id_lector) if nombre == 'ensamble' else modelos.ranking(nombre, id_lector)
 
-def recomendador_torres(nombre, id_lector, N=9, database_file=DATABASE_ENTRENAMIENTO_FILE):
-    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_torres.ranking(nombre, database_file, id_lector, es_candidato))
 
-def recomendador_dos_torres(id_lector, N=9):
-    return recomendador_torres('dos_torres', id_lector, N)
+def _conoce_lector(nombre, id_lector):
+    # si el modelo tiene al lector (si no, las cascadas usan visión de túnel)
+    return ensamble.conoce_lector(id_lector) if nombre == 'ensamble' else modelos.conoce_lector(nombre, id_lector)
 
-def recomendador_dos_torres_v2(id_lector, N=9):
-    return recomendador_torres('dos_torres_v2', id_lector, N)
 
-def recomendador_dos_torres_v2_completa(id_lector, N=9):
-    return recomendador_torres('dos_torres_v2_completa', id_lector, N, DATABASE_FILE)
+def recomendador_modelo(nombre):
+    # recomendador con uno de los modelos entrenados (modelos.py o ensamble.py)
+    def recomendador(id_lector, N=9):
+        # los N primeros del ranking del modelo, sin lo ya leído o visto
+        return _recomendador_por_ranking(id_lector, N, _ranking(nombre, id_lector))
+    return recomendador
 
-def recomendador_gran_torre(id_lector, N=9):
-    return recomendador_torres('gran_torre', id_lector, N)
 
-def recomendador_gran_torre_v2(id_lector, N=9):
-    return recomendador_torres('gran_torre_v2', id_lector, N)
-
-def recomendador_ease(id_lector, N=9):
-    return _recomendador_por_ranking(id_lector, N, lambda es_candidato: modelos_ease.ranking('ease', DATABASE_ENTRENAMIENTO_FILE, id_lector))
-
-def cant_interacciones(id_lector, database_file=DATABASE_FILE):
+def cant_interacciones(id_lector):
+    # valoraciones del lector, para elegir la rama de las cascadas
     query = "SELECT COUNT(*) AS cant FROM interacciones WHERE id_lector = ? AND COALESCE(rating, 0) > 0"
-    return sql_select(query, (id_lector,), database_file)[0]['cant']
+    return sql_select(query, (id_lector,))[0]['cant']
 
-def recomendador_cascada_v1(id_lector, N=9):
-    # no usa la base reducida: elige el algoritmo según las interacciones del lector
-    # en la base completa. Arranque en frío (hasta CASCADA_ARRANQUE_FRIO) con los mejor
-    # valorados, pocas (hasta CASCADA_POCAS) con visión de túnel, y el resto con dos
-    # torres. Los lectores con muchas interacciones que quedaron afuera del modelo
-    # (casi todas son de libros con pocas valoraciones) también van a visión de túnel
-    cant = cant_interacciones(id_lector)
-    if cant <= CASCADA_ARRANQUE_FRIO:
-        return recomendador_top_n(id_lector, N)
-    if cant <= CASCADA_POCAS or not modelos_torres.conoce_lector('dos_torres_v2_completa', DATABASE_FILE, id_lector):
-        return recomendador_vision_tunel(id_lector, N)
-    return recomendador_dos_torres_v2_completa(id_lector, N)
 
-def _cascada_base_reducida(recomendador_modelo, conoce_lector, id_lector, N):
-    # elige el algoritmo según las interacciones del lector en la base completa:
-    # arranque en frío (hasta CASCADA_ARRANQUE_FRIO) con los mejor valorados, hasta
-    # CASCADA_V2_MAX_VISION_TUNEL con visión de túnel, y el resto con recomendador_modelo,
-    # entrenado con la base reducida. Los que no entraron en esa base no están en el
-    # modelo (muchas de sus interacciones son de libros poco valorados), y también
-    # van a visión de túnel
-    cant = cant_interacciones(id_lector)
-    if cant <= CASCADA_ARRANQUE_FRIO:
-        return recomendador_top_n(id_lector, N)
-    if cant <= CASCADA_V2_MAX_VISION_TUNEL or not conoce_lector(id_lector):
-        return recomendador_vision_tunel(id_lector, N)
-    return recomendador_modelo(id_lector, N)
+def recomendador_cascada(nombre):
+    # Elige el algoritmo según cuánto se conoce al lector: arranque en frío
+    # (hasta CASCADA_ARRANQUE_FRIO valoraciones) con top_n; si el modelo no lo
+    # conoce (quedó afuera del filtro de la base, cuyo mínimo eligió Optuna) con
+    # visión de túnel, que puede recomendar cualquier libro; el resto con el modelo
+    modelo = recomendador_modelo(nombre)
+    def recomendador(id_lector, N=9):
+        # la cascada para un lector
+        if cant_interacciones(id_lector) <= CASCADA_ARRANQUE_FRIO:
+            return recomendador_top_n(id_lector, N)
+        if not _conoce_lector(nombre, id_lector):
+            return recomendador_vision_tunel(id_lector, N)
+        return modelo(id_lector, N)
+    return recomendador
 
-def recomendador_cascada_v2(id_lector, N=9):
-    conoce = lambda id_lector: modelos_torres.conoce_lector('dos_torres_v2', DATABASE_ENTRENAMIENTO_FILE, id_lector)
-    return _cascada_base_reducida(recomendador_dos_torres_v2, conoce, id_lector, N)
-
-def recomendador_cascada_v3(id_lector, N=9):
-    conoce = lambda id_lector: modelos_torres.conoce_lector('gran_torre_v2', DATABASE_ENTRENAMIENTO_FILE, id_lector)
-    return _cascada_base_reducida(recomendador_gran_torre_v2, conoce, id_lector, N)
-
-def recomendador_cascada_v4(id_lector, N=9):
-    conoce = lambda id_lector: modelos_surprise.conoce_lector('svd', DATABASE_ENTRENAMIENTO_FILE, id_lector)
-    return _cascada_base_reducida(recomendador_svd, conoce, id_lector, N)
-
-def recomendador_cascada_v5(id_lector, N=9):
-    conoce = lambda id_lector: modelos_ease.conoce_lector('ease', DATABASE_ENTRENAMIENTO_FILE, id_lector)
-    return _cascada_base_reducida(recomendador_ease, conoce, id_lector, N)
 
 def resetear_recientes(id_lector, fecha_limite='2026-09-01 23:59:59'):
+    # borra lo que el lector vio y valoró desde fecha_limite (las pruebas en la app)
     sql_execute("DELETE FROM vistas WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
     sql_execute("DELETE FROM interacciones WHERE id_lector = ? AND fecha > ?", (id_lector, fecha_limite))
 
@@ -401,24 +305,15 @@ ALGORITMOS = {
     'mas_valorados': recomendador_mas_valorados,
     'perfil_balanceado': recomendador_perfil_balanceado,
     'vision_tunel': recomendador_vision_tunel,
-    'baseline': recomendador_baseline,
-    'knn': recomendador_knn,
-    'svd': recomendador_svd,
-    'dos_torres': recomendador_dos_torres,
-    'dos_torres_v2': recomendador_dos_torres_v2,
-    'gran_torre': recomendador_gran_torre,
-    'gran_torre_v2': recomendador_gran_torre_v2,
-    'ease': recomendador_ease,
-    'cascada_v1': recomendador_cascada_v1,
-    'cascada_v2': recomendador_cascada_v2,
-    'cascada_v3': recomendador_cascada_v3,
-    'cascada_v4': recomendador_cascada_v4,
-    'cascada_v5': recomendador_cascada_v5,
+    **{nombre: recomendador_modelo(nombre) for nombre in NOMBRES_MODELOS},
+    **{f'cascada_{nombre}': recomendador_cascada(nombre) for nombre in NOMBRES_MODELOS},
 }
 ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
+SQL = ('random', 'top_n', 'mas_valorados', 'perfil_balanceado', 'vision_tunel')
 
 
 def recomendar(id_lector, algoritmo=ALGORITMO_POR_DEFECTO, N=9):
+    # recomendación para la app: además de calcularla, la registra como vista
     recomendador = ALGORITMOS.get(algoritmo, ALGORITMOS[ALGORITMO_POR_DEFECTO])
     rec = recomendador(id_lector, N)
 
@@ -437,18 +332,18 @@ def generar_predicciones(algoritmo, workers=8):
     # cada lector pide tantos libros como veces aparece en el archivo base (20)
     cant_por_lector = Counter(filas)
     def libros_de(id_lector):
+        # ids de los libros recomendados a un lector
         return [r['id_libro'] for r in recomendador(id_lector, cant_por_lector[id_lector])]
 
-    # cada consulta abre su propia conexión, así que se pueden correr en paralelo.
-    # Los modelos de Surprise y de torres no: calculan en Python y no en SQLite, y
-    # con varios hilos compitiendo por el GIL tardan bastante más que con uno solo.
-    # Las cascadas usan dos torres con la mayoría de los lectores
-    if algoritmo in modelos_surprise.CONSTRUCTORES or algoritmo in modelos_torres.NOMBRES or algoritmo in modelos_ease.NOMBRES or algoritmo.startswith('cascada'):
+    # los algoritmos SQL se pueden correr en paralelo (cada consulta abre su
+    # conexión); los modelos y las cascadas calculan con NumPy y con varios hilos
+    # compiten por el GIL, así que van en uno solo
+    if algoritmo not in SQL:
         workers = 1
     with ThreadPoolExecutor(workers) as pool:
         libros = dict(zip(cant_por_lector, pool.map(libros_de, cant_por_lector)))
 
-    archivo = os.path.dirname(__file__) + f'/data/prediction_{algoritmo}.csv'
+    archivo = os.path.dirname(os.path.abspath(__file__)) + f'/data/prediction_{algoritmo}.csv'
     with open(archivo, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f, lineterminator='\n')
         writer.writerow(['id_lector', 'id_libro'])
