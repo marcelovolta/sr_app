@@ -38,6 +38,7 @@ class Evaluador:
     # Mide NDCG@K de un modelo entrenado sobre train contra lo que el lector
     # leyó después (validación o test)
     def __init__(self, train, test):
+        # los libros de test de cada lector y la lista de respaldo (los más leídos)
         self.test = test.groupby('id_lector')['id_libro'].apply(set).to_dict()
         self.lectores = sorted(self.test)
         leidos = train.groupby('id_lector')['id_libro'].apply(set).to_dict()
