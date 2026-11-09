@@ -16,21 +16,35 @@ import scipy.sparse as sps
 #               no cambia el orden), igual para todos los lectores.
 # - svd:        SVD de Surprise (factorización de matrices sobre el rating).
 # - ease:       EASE (Steck 2019): modelo lineal libro a libro con solución cerrada.
+#               Opcionalmente con atributos de los libros como pseudo-lectores.
 # - dos_torres: embeddings de lector y libro entrenados con softmax sobre los
 #               negativos del batch y corrección logQ; puntaje = similitud coseno.
+#               Opcionalmente cada torre suma embeddings de sus atributos.
 # - gran_torre: red densa sobre lector, libro y sus rasgos (autor, género,
 #               editorial, año; género y nacimiento del lector), entrenada para
 #               separar libros elegidos de libros al azar.
 #
-# Se probó agregarles complejidad (atributos y capas en dos torres, más capas,
-# dropout, España y antigüedad del libro en gran torre) y no mejoraron: ver
-# reportes/intento_complejidad.md.
+# Se probó agregarles complejidad (capas en dos torres; más capas, dropout,
+# España y antigüedad del libro en gran torre) y no mejoraron: ver
+# reportes/intento_complejidad.md. Los atributos en EASE y dos torres son
+# hiperparámetros: Optuna decide si se usan (INICIALES asegura que se pruebe
+# también la mejor configuración sin atributos).
 #
 # Los hiperparámetros de cada uno (y el filtro de la base) los elige
 # optimizacion.py; acá sólo se definen el espacio de búsqueda y el entrenamiento.
 NOMBRES = ('naive', 'svd', 'ease', 'dos_torres', 'gran_torre')
 CARPETA_MODELOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modelos')
 SEMILLA = 42
+ATRIBUTOS_EASE = ('autor', 'genero', 'editorial', 'decada')
+PESO_MINIMO = 1e-3  # peso de un atributo en EASE que equivale a no usarlo
+
+# Primeros trials de Optuna: la mejor configuración sin atributos de la corrida
+# anterior, para que los atributos sólo se elijan si la superan
+INICIALES = {
+    'ease': [{'min_libro': 5, 'lambda': 771.5, **{f'peso_{a}': PESO_MINIMO for a in ATRIBUTOS_EASE}}],
+    'dos_torres': [{'min_libro': 8, 'rating_positivo': 5, 'dim': 256, 'temperatura': 0.1046,
+                    'learning_rate': 0.00968, 'epochs': 17, 'atributos': False}],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +52,9 @@ SEMILLA = 42
 # ---------------------------------------------------------------------------
 
 def sugerir(nombre, trial):
-    # El filtro de la base es un hiperparámetro más de cada modelo: mínimo de
-    # interacciones por lector (no menos de 20) y por libro.
+    # El mínimo de interacciones por libro es un hiperparámetro más de cada
+    # modelo (el de lectores no: define el universo, ver datos.universo).
     p = {
-        'min_lector': trial.suggest_int('min_lector', 20, 80),
         'min_libro': trial.suggest_int('min_libro', 5, 50, log=True),
     }
     if nombre == 'naive':
@@ -55,12 +68,16 @@ def sugerir(nombre, trial):
         p['reg_all'] = trial.suggest_float('reg_all', 0.005, 0.5, log=True)
     elif nombre == 'ease':
         p['lambda'] = trial.suggest_float('lambda', 1, 1e5, log=True)
+        # cuánto co-leído suma compartir cada atributo (PESO_MINIMO = no usarlo)
+        for a in ATRIBUTOS_EASE:
+            p[f'peso_{a}'] = trial.suggest_float(f'peso_{a}', PESO_MINIMO, 10, log=True)
     elif nombre == 'dos_torres':
         p['rating_positivo'] = trial.suggest_int('rating_positivo', 1, 9)
         p['dim'] = trial.suggest_categorical('dim', [32, 64, 128, 256])
         p['temperatura'] = trial.suggest_float('temperatura', 0.02, 0.5, log=True)
         p['learning_rate'] = trial.suggest_float('learning_rate', 1e-3, 0.05, log=True)
         p['epochs'] = trial.suggest_int('epochs', 3, 20)
+        p['atributos'] = trial.suggest_categorical('atributos', [False, True])
     elif nombre == 'gran_torre':
         p['rating_positivo'] = trial.suggest_int('rating_positivo', 1, 9)
         p['negativos'] = trial.suggest_int('negativos', 2, 10)
@@ -101,7 +118,8 @@ def entrenar(nombre, df, params, base, al_final_de_epoca=None):
         m.update(_entrenar_surprise(nombre, df, params, ids_lectores, ids_libros))
     elif nombre == 'ease':
         X = sps.csr_matrix((np.ones(len(u), dtype=np.float32), (u, i)), shape=(nu, nb))
-        m['B'] = _ease(X, params['lambda'])
+        pesos = {a: params.get(f'peso_{a}', 0) for a in ATRIBUTOS_EASE}
+        m['B'] = _ease(X, params['lambda'], atributos_libros(base, ids_libros) if any(pesos.values()) else None, pesos)
     elif nombre in ('dos_torres', 'gran_torre'):
         aviso = None
         if al_final_de_epoca:
@@ -134,10 +152,45 @@ def _entrenar_surprise(nombre, df, params, ids_lectores, ids_libros):
             'qi': algo.qi[fila_libro].astype(np.float32)}
 
 
-def _ease(X, lam):
+def atributos_libros(base, ids_libros):
+    # autor, género, editorial y década de edición de cada libro, en el orden
+    # de ids_libros, como códigos enteros (-1 = sin dato)
+    with sqlite3.connect(base) as conn:
+        libros = pd.read_sql('SELECT id_libro, autor, genero, editorial, anio_edicion FROM libros', conn)
+    libros = libros.drop_duplicates('id_libro').set_index('id_libro').reindex(ids_libros)
+    anio = pd.to_numeric(libros['anio_edicion'], errors='coerce')
+    libros['decada'] = (anio // 10).where(anio > 0)
+    return pd.DataFrame({a: libros[a].astype('category').cat.codes.to_numpy() for a in ATRIBUTOS_EASE},
+                        index=ids_libros)
+
+
+def atributos_lectores(base, ids_lectores):
+    # género, década de nacimiento y si vive en España de cada lector, como
+    # códigos enteros (-1 = sin dato)
+    with sqlite3.connect(base) as conn:
+        lectores = pd.read_sql('SELECT id_lector, genero, nacimiento, espania FROM lectores', conn)
+    lectores = lectores.drop_duplicates('id_lector').set_index('id_lector').reindex(ids_lectores)
+    anio = pd.to_numeric(lectores['nacimiento'], errors='coerce')
+    lectores['decada'] = (anio // 10).where(anio > 0)
+    return pd.DataFrame({a: lectores[a].astype('category').cat.codes.to_numpy() for a in ('genero', 'decada', 'espania')},
+                        index=ids_lectores)
+
+
+def _ease(X, lam, atributos=None, pesos=None):
     # P = (XᵀX + λI)⁻¹,  B = I − P / diag(P),  con diag(B) = 0.
-    # X binaria: cuenta que el lector leyó el libro, no el rating
+    # X binaria: cuenta que el lector leyó el libro, no el rating.
+    # Atributos (EASE con información lateral): cada valor de un atributo (un
+    # autor, un género...) es un pseudo-lector que "leyó" todos los libros con
+    # ese valor, con peso pesos[a]. En G = XᵀX eso suma pesos[a] a cada par de
+    # libros que comparten el atributo: el modelo los trata como algo co-leídos.
     G = (X.T @ X).toarray().astype(np.float64)
+    if atributos is not None:
+        for a, peso in pesos.items():
+            codigos = atributos[a].to_numpy()
+            con_dato = np.flatnonzero(codigos >= 0)
+            A = sps.csr_matrix((np.ones(len(con_dato)), (con_dato, codigos[con_dato])),
+                               shape=(len(codigos), codigos.max() + 1))
+            G += peso * (A @ A.T).toarray()
     G[np.diag_indices_from(G)] += lam
     P = np.linalg.inv(G)
     B = -P / np.diag(P)
@@ -167,20 +220,42 @@ def _entrenar_dos_torres(u, i, rating, ids_lectores, ids_libros, params, base, a
     frecuencia = np.bincount(i, minlength=nb) + 1
     log_q = np.log(frecuencia / frecuencia.sum()).astype(np.float32)
     dim, temperatura = params['dim'], params['temperatura']
+    # Con atributos, el vector de un libro es la suma de los embeddings de su id,
+    # autor, género, editorial y década, y el de un lector, la de su id, género,
+    # década de nacimiento y España. Los sin dato comparten un código propio.
+    # Ayuda a los libros y lectores con pocas lecturas: se parecen a otros con
+    # los mismos atributos.
+    codigos = {}
+    if params.get('atributos'):
+        for k, tabla in (('lector', atributos_lectores(base, ids_lectores)), ('libro', atributos_libros(base, ids_libros))):
+            for a in tabla:
+                c = tabla[a].to_numpy().astype(np.int64)
+                codigos[(k, a)] = np.where(c < 0, c.max() + 1, c)
 
     class DosTorres(keras.Model):
-        # una tabla de embeddings para lectores y otra para libros
+        # una tabla de embeddings para lectores y otra para libros (y una por atributo)
         def __init__(self):
-            # crea las dos tablas de embeddings
+            # crea las tablas de embeddings
             super().__init__()
             self.emb_lector = keras.layers.Embedding(nu, dim)
             self.emb_libro = keras.layers.Embedding(nb, dim)
+            self.emb_atributos = {f'{k}_{a}': keras.layers.Embedding(int(c.max()) + 1, dim, name=f'emb_{k}_{a}')
+                                  for (k, a), c in codigos.items()}
+            self.tablas = {f'{k}_{a}': ops.convert_to_tensor(c) for (k, a), c in codigos.items()}
+
+        def vector(self, k, indices):
+            # embedding del id más los de sus atributos
+            v = (self.emb_lector if k == 'lector' else self.emb_libro)(indices)
+            for nombre, emb in self.emb_atributos.items():
+                if nombre.startswith(k + '_'):
+                    v = v + emb(ops.take(self.tablas[nombre], indices))
+            return v
 
         def call(self, inputs):
             # puntajes de cada lector del batch contra cada libro del batch
             libro = inputs['libro']
-            a = ops.normalize(self.emb_lector(inputs['lector']), axis=1)
-            b = ops.normalize(self.emb_libro(libro), axis=1)
+            a = ops.normalize(self.vector('lector', inputs['lector']), axis=1)
+            b = ops.normalize(self.vector('libro', libro), axis=1)
             scores = ops.matmul(a, ops.transpose(b)) / temperatura
             scores = scores - ops.take(ops.convert_to_tensor(log_q), libro)[None, :]
             # el mismo libro en otra fila no es un negativo de verdad
@@ -194,8 +269,11 @@ def _entrenar_dos_torres(u, i, rating, ids_lectores, ids_libros, params, base, a
         return ops.sparse_categorical_crossentropy(correcto, scores, from_logits=True)
 
     def embeddings():
-        # normalizados: el producto escalar al predecir es la similitud coseno
+        # vector completo de cada lector y libro (id + atributos), normalizado:
+        # el producto escalar al predecir es la similitud coseno
         pesos = [e.get_weights()[0] for e in (modelo.emb_lector, modelo.emb_libro)]
+        for (k, a), c in codigos.items():
+            pesos[k == 'libro'] = pesos[k == 'libro'] + modelo.emb_atributos[f'{k}_{a}'].get_weights()[0][c]
         return {f'emb_{k}': (w / np.maximum(np.linalg.norm(w, axis=1, keepdims=True), 1e-12)).astype(np.float32)
                 for k, w in zip(('lector', 'libro'), pesos)}
 

@@ -1,5 +1,6 @@
 import datetime
 import os
+import sqlite3
 import time
 
 import numpy as np
@@ -13,29 +14,70 @@ import optimizacion
 
 # Ensamble de los modelos no SQL: un LightGBM (LambdaRank) reordena los
 # candidatos que proponen SVD, EASE, dos torres y gran torre, usando como
-# variables el puntaje y la posición que le da cada modelo a cada candidato.
+# variables el puntaje y la posición que le da cada modelo a cada candidato, y
+# variables de contenido: qué parte de lo que leyó el lector comparte autor,
+# género o editorial con el candidato, el año de edición y la popularidad.
 #
 # Para no tener fuga de datos (stacking), LightGBM nunca aprende de predicciones
-# de modelos que vieron las respuestas:
-# - etapa A: los modelos base se entrenan con train sin sus últimas 20
-#   interacciones por lector, y LightGBM aprende a predecir esas 20;
-# - etapa B: los modelos base se entrenan con train y el ensamble se evalúa en
-#   test, igual que los demás modelos (NDCG@20 comparable con su tabla). Con
-#   esto Optuna elige los hiperparámetros de LightGBM;
-# - final: LightGBM se entrena con la etapa B y se aplica sobre los modelos
-#   finales (entrenados con todos los datos).
+# de modelos que vieron las respuestas, y el test no participa de ninguna
+# elección (mismas etapas que los modelos sueltos, ver optimizacion.py):
+# - etapa A (validación): los modelos base se entrenan con train y LightGBM
+#   aprende a predecir la validación. Optuna elige sus hiperparámetros
+#   entrenando con el 80% de los lectores y midiendo en el 20% restante;
+# - etapa B (test): los modelos base se entrenan con train + validación y el
+#   LightGBM de la etapa A se evalúa en test, igual que los demás modelos
+#   (NDCG@20 comparable con su tabla);
+# - final: LightGBM se reentrena con la etapa B (las respuestas más recientes)
+#   y se aplica sobre los modelos finales (entrenados con todo el universo).
 # Como referencia se mide también un promedio simple: la media de los puntajes
 # de cada modelo, estandarizados por lector.
 MODELOS_BASE = ('svd', 'ease', 'dos_torres', 'gran_torre')
 CANDIDATOS = 50  # por modelo; los candidatos son la unión
 TRIALS = 30
-COLUMNAS = [f'{n}_{v}' for n in MODELOS_BASE for v in ('puntaje', 'posicion')]
+FRACCION_EVALUACION = 0.2  # lectores de la etapa A apartados para que Optuna mida
+CONTENIDO = ['afinidad_autor', 'afinidad_genero', 'afinidad_editorial', 'anio_edicion', 'popularidad']
+COLUMNAS = [f'{n}_{v}' for n in MODELOS_BASE for v in ('puntaje', 'posicion')] + CONTENIDO
 
 
-def candidatos(ms, lectores, lote=300):
+def tabla_libros(base):
+    # autor, género y editorial (códigos, -1 = sin dato) y año de edición de
+    # todos los libros, para las variables de contenido
+    with sqlite3.connect(base) as conn:
+        libros = pd.read_sql('SELECT id_libro, autor, genero, editorial, anio_edicion FROM libros', conn)
+    libros = libros.drop_duplicates('id_libro').set_index('id_libro')
+    tabla = pd.DataFrame({a: libros[a].astype('category').cat.codes.astype(np.int32)
+                          for a in ('autor', 'genero', 'editorial')}, index=libros.index)
+    anio = pd.to_numeric(libros['anio_edicion'], errors='coerce')
+    tabla['anio_edicion'] = anio.where(anio > 0).astype(np.float32)
+    return tabla
+
+
+def _contenido(libros, id_lector, m_ease, tabla):
+    # variables de contenido de los candidatos `libros` de un lector. Lo leído
+    # sale del modelo EASE de la misma etapa (el de catálogo más grande), así
+    # que nunca incluye lo que se está prediciendo
+    t = tabla.reindex(libros)
+    u = m_ease['indice_lector'].get(id_lector)
+    columnas = {}
+    if u is None:
+        for a in ('autor', 'genero', 'editorial'):
+            columnas[f'afinidad_{a}'] = np.full(len(libros), np.nan, dtype=np.float32)
+    else:
+        leido = tabla.reindex(m_ease['ids_libros'][m_ease['leidos'][u]])
+        for a in ('autor', 'genero', 'editorial'):
+            frecuencia = leido[a][leido[a] >= 0].value_counts() / max(len(leido), 1)
+            columnas[f'afinidad_{a}'] = t[a].map(frecuencia).fillna(0).where(t[a] >= 0).to_numpy(dtype=np.float32)
+    columnas['anio_edicion'] = t['anio_edicion'].to_numpy(dtype=np.float32)
+    j = pd.Index(m_ease['ids_libros']).get_indexer(libros)
+    columnas['popularidad'] = np.where(j >= 0, np.log1p(m_ease['popularidad'][j]), np.nan).astype(np.float32)
+    return columnas
+
+
+def candidatos(ms, lectores, tabla, lote=300):
     # Candidatos de cada lector (los CANDIDATOS primeros de cada modelo, sin lo
-    # ya leído) con el puntaje y la posición en cada modelo. Si un modelo no
-    # conoce al lector o al libro, sus columnas quedan vacías (LightGBM lo maneja)
+    # ya leído) con el puntaje y la posición en cada modelo y las variables de
+    # contenido. Si un modelo no conoce al lector o al libro, sus columnas
+    # quedan vacías (LightGBM lo maneja)
     indices = {n: pd.Index(m['ids_libros']) for n, m in ms.items()}
     partes = []
     for desde in range(0, len(lectores), lote):
@@ -67,6 +109,7 @@ def candidatos(ms, lectores, lote=300):
                     fila[f'{n}_posicion'] = np.where(j >= 0, posicion[j] + 1, np.nan).astype(np.float32)
                 else:
                     fila[f'{n}_puntaje'] = fila[f'{n}_posicion'] = np.full(len(libros), np.nan, dtype=np.float32)
+            fila.update(_contenido(libros, l, ms['ease'], tabla))
             partes.append(pd.DataFrame(fila))
     return pd.concat(partes, ignore_index=True)
 
@@ -119,56 +162,69 @@ def _bases(df, base):
     ms = {}
     for n in MODELOS_BASE:
         p = modelos.modelo(n)['params']
-        ms[n] = modelos.entrenar(n, datos.filtrar(df, p['min_lector'], p['min_libro']), p, base)
+        ms[n] = modelos.entrenar(n, datos.filtrar_libros(df, p['min_libro']), p, base)
     return ms
 
 
-def optimizar_y_entrenar(train, test, base, trials=TRIALS):
-    # etapas A y B (ver arriba), Optuna sobre LightGBM, modelo final y reporte
+def optimizar_y_entrenar(train, validacion, resto, test, base, trials=TRIALS):
+    # etapas A y B (ver arriba), Optuna sobre LightGBM, modelo final y reporte.
+    # resto = train + validación
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     inicio = time.time()
 
-    # etapa A: datos para entrenar LightGBM
-    train_a, etiquetas_a = datos.particionar(train)
-    relevantes_a = etiquetas_a.groupby('id_lector')['id_libro'].apply(set).to_dict()
-    cand_a = _con_etiquetas(candidatos(_bases(train_a, base), sorted(relevantes_a)), relevantes_a)
-    cand_a = cand_a[cand_a.groupby('id_lector')['relevante'].transform('any')]  # sin positivos no enseña nada
-    print(f'  ensamble etapa A: {len(cand_a)} candidatos de {cand_a.id_lector.nunique()} lectores', flush=True)
-
-    # etapa B: evaluación en test, comparable con los modelos sueltos
-    ev = optimizacion.Evaluador(train, test)
-    relevantes_b = test.groupby('id_lector')['id_libro'].apply(set).to_dict()
-    bases_b = _bases(train, base)
-    cand_b = _con_etiquetas(candidatos(bases_b, ev.lectores), relevantes_b)
-
-    def ndcg(listas):
-        # NDCG@20 de todos los lectores del test (respaldo para los no cubiertos)
-        return ev.ndcg({**ev.respaldo, **listas})
-
-    referencia = {n: ev.evaluar(m)['ndcg'] for n, m in bases_b.items()}
-    referencia['promedio simple'] = ndcg(_listas(cand_b, promedio_simple(cand_b)))
-    print(f'  ensamble referencias: { {k: round(v, 4) for k, v in referencia.items()} }', flush=True)
+    # etapa A: candidatos de los modelos entrenados con train, etiquetados con
+    # la validación. Los lectores se reparten entre ajuste y evaluación
+    relevantes_a = validacion.groupby('id_lector')['id_libro'].apply(set).to_dict()
+    tabla = tabla_libros(base)
+    cand_a = _con_etiquetas(candidatos(_bases(train, base), sorted(relevantes_a), tabla), relevantes_a)
+    lectores_a = np.array(sorted(relevantes_a))
+    np.random.default_rng(modelos.SEMILLA).shuffle(lectores_a)
+    evaluados = set(lectores_a[:int(len(lectores_a) * FRACCION_EVALUACION)])
+    ajuste = cand_a[~cand_a['id_lector'].isin(evaluados)]
+    ajuste = ajuste[ajuste.groupby('id_lector')['relevante'].transform('any')]  # sin positivos no enseña nada
+    cand_eval = cand_a[cand_a['id_lector'].isin(evaluados)]
+    ev_a = optimizacion.Evaluador(train, validacion[validacion['id_lector'].isin(evaluados)])
+    print(f'  ensamble etapa A: {len(ajuste)} candidatos para ajustar, {len(evaluados)} lectores para evaluar', flush=True)
 
     def objetivo(trial):
-        # LightGBM con los hiperparámetros del trial, evaluado en la etapa B
-        ranker = _ajustar(cand_a, _sugerir(trial))
-        valor = ndcg(_listas(cand_b, ranker.predict(cand_b[COLUMNAS])))
-        print(f'  ensamble trial {trial.number}: ndcg {valor:.4f}', flush=True)
+        # LightGBM con los hiperparámetros del trial, medido en los lectores apartados
+        ranker = _ajustar(ajuste, _sugerir(trial))
+        valor = ev_a.ndcg({**ev_a.respaldo, **_listas(cand_eval, ranker.predict(cand_eval[COLUMNAS]))})
+        print(f'  ensamble trial {trial.number}: ndcg (validación) {valor:.4f}', flush=True)
         return valor
 
     estudio = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=modelos.SEMILLA))
     estudio.optimize(objetivo, n_trials=trials)
     params = estudio.best_params
 
+    # etapa B: LightGBM de la etapa A (con todos sus lectores) evaluado en test,
+    # sobre los modelos base entrenados con train + validación
+    ranker_a = _ajustar(cand_a[cand_a.groupby('id_lector')['relevante'].transform('any')], params)
+    ev = optimizacion.Evaluador(resto, test)
+    relevantes_b = test.groupby('id_lector')['id_libro'].apply(set).to_dict()
+    bases_b = _bases(resto, base)
+    cand_b = _con_etiquetas(candidatos(bases_b, ev.lectores, tabla), relevantes_b)
+
+    def ndcg(listas):
+        # NDCG@20 en test de todos los lectores del universo (respaldo para los no cubiertos)
+        return ev.ndcg({**ev.respaldo, **listas})
+
+    ndcg_test = ndcg(_listas(cand_b, ranker_a.predict(cand_b[COLUMNAS])))
+    referencia = {n: ev.evaluar(m)['ndcg'] for n, m in bases_b.items()}
+    referencia['promedio simple'] = ndcg(_listas(cand_b, promedio_simple(cand_b)))
+    print(f'  ensamble test: {ndcg_test:.4f}; referencias: { {k: round(v, 4) for k, v in referencia.items()} }', flush=True)
+
     # final: LightGBM con la etapa B (los modelos base finales ya están guardados)
-    final = _ajustar(cand_b, params)
+    final = _ajustar(cand_b[cand_b.groupby('id_lector')['relevante'].transform('any')], params)
     m = {
         'nombre': 'ensamble',
         'params': params,
         'booster': final.model_to_string(),
+        'libros': tabla,
         'optimizacion': {
             'fecha': datetime.datetime.now().isoformat(timespec='minutes'),
-            'ndcg': estudio.best_value,
+            'ndcg': ndcg_test,
+            'ndcg_validacion': estudio.best_value,
             'ndcg_popularidad': ev.ndcg(ev.respaldo),
             'referencia': referencia,
             'trials': trials,
@@ -204,15 +260,17 @@ def conoce_lector(id_lector):
     return any(modelos.conoce_lector(n, id_lector) for n in MODELOS_BASE)
 
 
-def ranking(id_lector):
-    # candidatos de los modelos finales reordenados por LightGBM. Si ningún
-    # modelo conoce al lector, los más leídos (de EASE, el de catálogo más grande)
+def ranking(id_lector, promedio=False):
+    # candidatos de los modelos finales reordenados por LightGBM (o, con
+    # promedio=True, por el promedio simple de los puntajes estandarizados).
+    # Si ningún modelo conoce al lector, los más leídos (de EASE, el de
+    # catálogo más grande)
     ms = {n: modelos.modelo(n) for n in MODELOS_BASE}
     if not conoce_lector(id_lector):
         yield from modelos.ranking('ease', id_lector)
         return
-    df = candidatos(ms, [id_lector])
-    puntaje = _ranker().predict(df[COLUMNAS])
+    df = candidatos(ms, [id_lector], modelos.modelo('ensamble')['libros'])
+    puntaje = promedio_simple(df).to_numpy() if promedio else _ranker().predict(df[COLUMNAS])
     for j in np.argsort(-puntaje, kind='stable'):
         yield df['id_libro'].iat[j], puntaje[j]
     # si el lector ya vio todos los candidatos (en la app), se sigue con EASE
@@ -231,19 +289,22 @@ def reporte(m):
     total = sum(v for _, v in importancia) or 1
     lineas = [
         '# Ensamble (LightGBM)', '',
-        f"Optimizado el {o['fecha']} con {o['trials']} trials de Optuna (TPE), maximizando NDCG@{optimizacion.K}.", '',
+        f"Optimizado el {o['fecha']} con {o['trials']} trials de Optuna (TPE), maximizando NDCG@{optimizacion.K} "
+        'en validación (lectores apartados de la etapa A).', '',
         '## Cómo funciona', '',
         f'- Candidatos: los {CANDIDATOS} primeros libros de cada modelo base ({", ".join(MODELOS_BASE)}), unidos.',
-        '- Variables: el puntaje y la posición de cada candidato en cada modelo.',
+        '- Variables: el puntaje y la posición de cada candidato en cada modelo, y de contenido: qué parte de lo '
+        'que leyó el lector comparte autor, género o editorial con el candidato, el año de edición y la popularidad.',
         '- LightGBM con objetivo LambdaRank reordena los candidatos.',
-        '- Sin fuga de datos: LightGBM se entrena con modelos base que no vieron las respuestas '
-        '(train sin sus últimas 20 interacciones por lector → esas 20) y se evalúa en test.',
+        '- Sin fuga de datos: LightGBM aprende a predecir la validación con modelos base entrenados con train, '
+        'y se evalúa en test con modelos base entrenados con train + validación.',
         '', '## Resultado (NDCG@20 en test)', '',
         '| Modelo | NDCG@20 |', '|---|---|',
         f"| **Ensamble LightGBM** | **{o['ndcg']:.4f}** |",
         *[f'| {k} | {v:.4f} |' for k, v in sorted(o['referencia'].items(), key=lambda x: -x[1])],
         f"| popularidad | {o['ndcg_popularidad']:.4f} |",
-        '', f"Lectores del test cubiertos por algún modelo base: {o['lectores_cubiertos']:.0%}.",
+        '', f"NDCG@20 en validación (el que maximizó Optuna): {o['ndcg_validacion']:.4f}.",
+        '', f"Lectores del universo que conoce algún modelo base: {o['lectores_cubiertos']:.0%}.",
         '', '## Importancia de las variables (ganancia)', '',
         '| Variable | Importancia |', '|---|---|',
         *[f'| {k} | {v / total:.0%} |' for k, v in importancia],

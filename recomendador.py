@@ -307,6 +307,9 @@ ALGORITMOS = {
     'vision_tunel': recomendador_vision_tunel,
     **{nombre: recomendador_modelo(nombre) for nombre in NOMBRES_MODELOS},
     **{f'cascada_{nombre}': recomendador_cascada(nombre) for nombre in NOMBRES_MODELOS},
+    # los candidatos del ensamble ordenados por el promedio simple de los
+    # puntajes estandarizados, en vez de LightGBM (en la optimización rindió igual)
+    'promedio': lambda id_lector, N=9: _recomendador_por_ranking(id_lector, N, ensamble.ranking(id_lector, promedio=True)),
 }
 ALGORITMO_POR_DEFECTO = 'perfil_balanceado'
 SQL = ('random', 'top_n', 'mas_valorados', 'perfil_balanceado', 'vision_tunel')

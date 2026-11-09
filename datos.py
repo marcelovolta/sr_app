@@ -7,11 +7,15 @@ import pandas as pd
 
 
 # Datos para entrenar y evaluar los modelos: copia de la base, lectura de las
-# interacciones en orden cronológico, filtro recursivo y partición train/test.
+# interacciones en orden cronológico, universo de lectores, filtro de libros y
+# partición train / validación / test.
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 BASE_ORIGEN = os.path.join(RAIZ, 'data', 'data.db')
 BASE_TRABAJO = os.path.join(RAIZ, 'data', 'trabajo', 'data.db')
-N_TEST = 20  # las últimas 20 interacciones de cada lector son su test
+MIN_LECTOR = 30    # universo: lectores con al menos 30 interacciones
+N_TEST = 10        # las últimas 10 de cada lector son test
+N_VALIDACION = 10  # las 10 anteriores, validación (el resto, train)
+MIN_LECTOR_FINAL = 10  # universo del modelo final (el que recomienda): ver universo
 
 
 def copiar_base(origen=BASE_ORIGEN, destino=BASE_TRABAJO, intentos=30):
@@ -54,27 +58,47 @@ def leer_interacciones(base=BASE_TRABAJO):
     return df.sort_values(['id_lector', 'fecha', 'orden'], kind='stable').reset_index(drop=True)
 
 
-def filtrar(df, min_lector, min_libro):
-    # Filtro recursivo (como en stepbystepdatascience.com/ease): se sacan los
-    # libros con menos de min_libro interacciones y los lectores con menos de
-    # min_lector, y se repite hasta que no cambie nada, porque cada paso puede
-    # dejar a otros por debajo del mínimo.
-    while True:
-        n = len(df)
-        por_libro = df.groupby('id_libro')['id_lector'].transform('size')
-        df = df[por_libro >= min_libro]
-        por_lector = df.groupby('id_lector')['id_libro'].transform('size')
-        df = df[por_lector >= min_lector]
-        if len(df) == n:
-            return df
+def universo(df, min_lector=MIN_LECTOR):
+    # Lectores del universo de los modelos: los que tienen al menos min_lector
+    # interacciones en total. Todos tienen test, validación y al menos
+    # min_lector - N_TEST - N_VALIDACION interacciones de train, así que todo
+    # lector con el que se entrena también se evalúa, y viceversa. Es un valor
+    # fijo (no un hiperparámetro): si cambiara entre trials, cada trial se
+    # evaluaría con otros lectores y los NDCG no serían comparables.
+    # El modelo final usa otro universo, más amplio (MIN_LECTOR_FINAL: tantas
+    # interacciones como el train mínimo de la optimización), para recomendar
+    # también a los lectores con esa historia; con los hiperparámetros elegidos
+    # en el universo de evaluación.
+    por_lector = df.groupby('id_lector')['id_libro'].transform('size')
+    return df[por_lector >= min_lector]
 
 
-def particionar(df, n_test=N_TEST):
-    # Partición cronológica por lector: las últimas n_test interacciones son test
-    # y las anteriores train, así ningún modelo ve el futuro de lo que se evalúa.
-    # Los lectores con n_test interacciones o menos quedan enteros en train (sirven
-    # para entrenar, pero no se pueden evaluar).
+def filtrar_libros(df, min_libro):
+    # Saca los libros con menos de min_libro interacciones en df (un libro casi
+    # sin lectores no se puede aprender bien). Se cuenta sobre los datos de
+    # entrenamiento de cada etapa, para no usar lecturas futuras. No saca
+    # lectores: el universo es fijo.
+    por_libro = df.groupby('id_libro')['id_lector'].transform('size')
+    return df[por_libro >= min_libro]
+
+
+def particionar(df, n):
+    # Partición cronológica por lector: las últimas n interacciones de cada
+    # lector por un lado y las anteriores por el otro. Ningún modelo ve el
+    # futuro de lo que se evalúa.
     posicion_desde_el_final = df.groupby('id_lector').cumcount(ascending=False)
-    total = df.groupby('id_lector')['id_libro'].transform('size')
-    es_test = (posicion_desde_el_final < n_test) & (total > n_test)
-    return df[~es_test], df[es_test]
+    ultimas = posicion_desde_el_final < n
+    return df[~ultimas], df[ultimas]
+
+
+def particiones(df):
+    # Universo y partición en tres tramos por lector:
+    #   test: las últimas N_TEST; mide el resultado que se informa
+    #   validación: las N_VALIDACION anteriores; con ellas Optuna elige los
+    #     hiperparámetros, así el test no participa de ninguna elección
+    #   train: el resto
+    # Devuelve (universo, train, validacion, test).
+    u = universo(df)
+    resto, test = particionar(u, N_TEST)
+    train, validacion = particionar(resto, N_VALIDACION)
+    return u, train, validacion, test

@@ -37,6 +37,7 @@
                     <option value="cascada_gran_torre">Cascada gran torre</option>
                     <option value="ensamble">Ensamble (LightGBM)</option>
                     <option value="cascada_ensamble">Cascada ensamble</option>
+                    <option value="promedio">Promedio de modelos</option>
                 </select>
             </label>
             <p id="descripcion-algoritmo" class="text-xs text-neutral-500 mt-1"></p>
@@ -95,6 +96,7 @@
             cascada_dos_torres: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, dos torres.",
             cascada_gran_torre: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si el modelo no te conoce todavía, visión de túnel; si no, una gran torre.",
             ensamble: "Combina SVD, EASE, dos torres y gran torre: un modelo LightGBM reordena los libros que propone cada uno según el puntaje y la posición que le dan.",
+            promedio: "Combina SVD, EASE, dos torres y gran torre: ordena los libros que propone cada uno por el promedio de sus puntajes.",
             cascada_ensamble: "Elige el algoritmo según cuánto te conoce: con hasta 2 valoraciones, los libros mejor valorados; si ningún modelo te conoce todavía, visión de túnel; si no, el ensamble de modelos."
         };
 

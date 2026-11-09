@@ -43,9 +43,10 @@ Optuna, LightGBM y matplotlib.
    se puede bloquear. Se copia el archivo sin abrirlo con SQLite, y la copia se acepta sólo si
    el archivo no cambió durante la copia, no había una transacción a medio escribir y pasa el
    chequeo de integridad. Todo lo demás trabaja sobre `data/trabajo/data.db`.
-2. **Partición train/test.** Ver [Evaluación](#evaluación).
-3. **Optimización de cada modelo** con Optuna, entrenamiento final con todos los datos,
-   curva de entrenamiento (redes) y reporte.
+2. **Universo y partición** train / validación / test. Ver [Evaluación](#evaluación).
+3. **Optimización de cada modelo** con Optuna (train → validación), medición en test
+   (train + validación → test), entrenamiento final con los lectores con al menos 10
+   interacciones, curva de entrenamiento (redes) y reporte.
 4. **Ensamble.**
 5. **Predicciones**: borra los CSV viejos y genera los de todos los algoritmos.
 6. **Resumen**: `reportes/resumen.md`.
@@ -55,25 +56,54 @@ Optuna, LightGBM y matplotlib.
 - Se usan las valoraciones (rating > 0) de libros y lectores que existen en sus tablas.
 - **Orden cronológico por lector.** Las fechas son por día y hay muchos empates (cargas
   masivas), así que se desempata por orden de inserción.
-- **Filtro recursivo** (como en el artículo de EASE de stepbystepdatascience.com): se sacan los
-  libros con menos de `min_libro` interacciones y los lectores con menos de `min_lector`, y se
-  repite hasta que no cambie nada, porque cada paso puede dejar a otros por debajo del mínimo.
-  Los dos mínimos son **hiperparámetros de cada modelo** (`min_lector` ≥ 20).
+- **Universo de evaluación:** los lectores con al menos 30 interacciones (3203). Es fijo, no
+  un hiperparámetro: si cambiara entre trials, cada trial se evaluaría con otros lectores y los
+  NDCG no serían comparables.
+- **Universo del modelo final:** los lectores con al menos 10 interacciones (5241), tantas como
+  el train mínimo de la optimización. Los que tienen menos no entran a los modelos; en las
+  cascadas los atienden `top_n` o `vision_tunel`.
+- **Filtro de libros:** se sacan los libros con menos de `min_libro` interacciones, contadas
+  sólo sobre los datos de entrenamiento de cada etapa (para no usar lecturas futuras). Es un
+  **hiperparámetro de cada modelo** y no saca lectores.
 
 ## Evaluación
 
-- **Partición cronológica por lector:** las últimas 20 interacciones de cada lector son test y
-  las anteriores train, así ningún modelo ve el futuro de lo que se evalúa. Los lectores con 20
-  interacciones o menos quedan enteros en train: sirven para entrenar pero no se evalúan.
-  Quedan 3801 lectores evaluados.
-- **Métrica: NDCG@20.** Relevante = cualquier libro leído en el test, sin importar el rating
-  (igual que en Kaggle: acertar qué va a leer).
-- **Siempre los mismos lectores evaluados.** Los que el filtro deja afuera de un modelo reciben
-  los más leídos de train. Si no, un filtro exigente se evaluaría sólo con lectores fáciles y
-  parecería mejor de lo que es.
-- **El filtro se aplica sólo a train**, para no usar información del test.
-- Los hiperparámetros se eligen en el mismo test con el que se informa el NDCG, así que los
-  valores son algo optimistas. Sirven para comparar modelos entre sí.
+- **Partición cronológica por lector**, dentro del universo:
+
+  | Tramo | Interacciones de cada lector |
+  |---|---|
+  | Test | las últimas 10 |
+  | Validación | las 10 anteriores |
+  | Train | el resto (al menos 10) |
+
+  Ningún modelo ve el futuro de lo que se evalúa, y **todo lector con el que se entrena también
+  se evalúa**, y viceversa.
+- **Tres etapas:**
+  1. Optuna entrena con train y elige los hiperparámetros maximizando NDCG@20 en validación.
+  2. Con los mejores, se reentrena con train + validación y se mide en test. **Ese es el NDCG que
+     se informa**: el test no participó de ninguna elección.
+  3. El modelo final se entrena con todos los lectores con al menos 10 interacciones y todas sus
+     interacciones (para la app y Kaggle), con los hiperparámetros elegidos. A los lectores de
+     10 a 29 interacciones no se los puede evaluar con este esquema: para ellos el resultado es
+     una extrapolación razonable (tienen tanta historia como el train mínimo de la optimización).
+- **Métrica: NDCG@20.** Relevante = cualquier libro leído, sin importar el rating (igual que en
+  Kaggle: acertar qué va a leer). Con 10 libros de test por lector el NDCG es más bajo que con
+  20, porque hay menos aciertos posibles: no se compara con corridas anteriores (ver
+  [Historial de experimentos](#historial-de-experimentos)).
+
+### Por qué este esquema
+
+La versión anterior separaba las últimas 20 interacciones como test y aplicaba un mínimo de
+interacciones por lector (`min_lector`, hiperparámetro) sólo sobre train. Eso tenía dos
+problemas:
+
+- **Se evaluaba con lectores que el modelo no había visto.** Un lector de 21 interacciones tenía
+  1 en train y el filtro lo sacaba: en la evaluación lo atendía la popularidad, pero en el
+  modelo final (entrenado con todo) sí entraba. Optuna elegía el filtro mirando una situación
+  distinta de la de uso, y modelos flojos como SVD elegían un filtro alto para que la
+  popularidad atendiera a casi todos.
+- **El NDCG era optimista:** los hiperparámetros se elegían con el mismo test con el que se
+  informaba el resultado.
 
 ## Algoritmos SQL (`recomendador.py`)
 
@@ -113,7 +143,12 @@ Hiperparámetros: cantidad de factores, épocas, learning rate, regularización.
 ### ease (Steck, 2019)
 Modelo lineal libro a libro con solución cerrada: `B = I − P / diag(P)` con
 `P = (XᵀX + λI)⁻¹` y la diagonal de B en 0. X es binaria (leyó o no). El puntaje de un libro
-es la suma de los pesos que le dan los libros que el lector leyó. Único hiperparámetro: λ.
+es la suma de los pesos que le dan los libros que el lector leyó. Hiperparámetro principal: λ.
+
+**Atributos (opcionales):** cada autor, género, editorial y década es un pseudo-lector que
+"leyó" todos los libros con ese valor. Eso suma un peso a cada par de libros que comparten el
+atributo, como si fueran algo co-leídos. Optuna elige los cuatro pesos (un peso mínimo equivale
+a no usarlo). En libros eligió no usarlos.
 
 ### dos_torres
 Un embedding por lector y otro por libro; puntaje = similitud coseno. Se entrena con softmax
@@ -121,7 +156,11 @@ sobre los **negativos del batch**: cada par (lector, libro elegido) usa como neg
 libros de las demás filas. A cada libro se le resta el log de su frecuencia (**corrección
 logQ**, Yi et al. 2019), porque si no, los populares aparecen demasiado como negativos y el
 modelo se va a los populares. Elegido = rating ≥ `rating_positivo`. Hiperparámetros:
-`rating_positivo`, dimensión, temperatura, learning rate, épocas.
+`rating_positivo`, dimensión, temperatura, learning rate, épocas y `atributos`.
+
+**Atributos (opcionales, los decide Optuna):** el vector del libro es la suma de los embeddings
+de su id, autor, género, editorial y década, y el del lector, la de su id, género, década de
+nacimiento y España. En libros Optuna eligió no usarlos (0,1201 contra 0,1366 en validación).
 
 ### gran_torre
 Una red que mira cada par (lector, libro): embeddings del lector, del libro y de sus rasgos
@@ -135,51 +174,104 @@ primera capa se separa en una parte del lector y otra del libro que se precalcul
 
 - **Candidatos:** los 50 primeros libros de cada modelo (SVD, EASE, dos torres y gran torre),
   unidos.
-- **Variables:** el puntaje y la posición que le da cada modelo a cada candidato.
+- **Variables:** el puntaje y la posición que le da cada modelo a cada candidato, y de
+  contenido: qué parte de lo que leyó el lector comparte autor, género o editorial con el
+  candidato, el año de edición y la popularidad del libro.
 - **Modelo:** LightGBM con objetivo LambdaRank reordena los candidatos de cada lector.
 - **Sin fuga de datos (stacking):** LightGBM nunca aprende de predicciones de modelos que
   vieron las respuestas.
-  - Etapa A: los modelos base se entrenan con train sin sus últimas 20 interacciones por
-    lector, y LightGBM aprende a predecir esas 20.
-  - Etapa B: los modelos base se entrenan con train, y el ensamble se evalúa en test. Con esto
-    Optuna elige los hiperparámetros de LightGBM.
-  - Final: LightGBM se entrena con la etapa B y se aplica sobre los modelos finales.
+  - Etapa A (validación): los modelos base se entrenan con train y LightGBM aprende a predecir
+    la validación. Optuna elige sus hiperparámetros entrenando con el 80% de los lectores y
+    midiendo en el 20% restante.
+  - Etapa B (test): los modelos base se entrenan con train + validación y el LightGBM de la
+    etapa A se evalúa en test, como los demás modelos.
+  - Final: LightGBM se reentrena con la etapa B y se aplica sobre los modelos finales.
+- **`promedio`:** los mismos candidatos ordenados por el promedio simple de los puntajes
+  (estandarizados por lector), como referencia y como algoritmo propio
+  (`prediction_promedio.csv`).
 
 ## Cascadas
 
 `cascada_<modelo>` para cada modelo y para el ensamble:
 
 1. Hasta 2 valoraciones (arranque en frío): `top_n`.
-2. Si el modelo no conoce al lector (quedó afuera del filtro): `vision_tunel`, que puede
+2. Si el modelo no conoce al lector (menos de 10 interacciones): `vision_tunel`, que puede
    recomendar cualquier libro.
 3. El resto: el modelo.
 
 ## Resultados
 
-NDCG@20 en test (detalle en [`reportes/resumen.md`](reportes/resumen.md)):
+### Modelos (NDCG@20 en test, 3203 lectores)
 
-| Modelo | NDCG@20 | vs popularidad |
-|---|---|---|
-| ensamble | **0,1251** | 1,41× |
-| ease | 0,1211 | 1,36× |
-| dos_torres | 0,1178 | 1,33× |
-| gran_torre | 0,1070 | 1,20× |
-| svd | 0,0880 | 0,99× |
-| naive | 0,0878 | 0,99× |
-| *popularidad* | *0,0889* | |
+Detalle en [`reportes/resumen.md`](reportes/resumen.md) y en el reporte de cada modelo.
+
+| Modelo | NDCG@20 (test) | vs popularidad | NDCG@20 (validación) | min_libro | Libros (final) |
+|---|---|---|---|---|---|
+| **ensamble** | **0,1074** | **2,13×** | 0,1566 | — | — |
+| ease | 0,0981 | 1,95× | 0,1332 | 6 | 10 174 |
+| dos_torres | 0,0977 | 1,94× | 0,1366 | 9 | 7 121 |
+| *promedio simple* | *0,0976* | *1,94×* | | | |
+| gran_torre | 0,0787 | 1,56× | 0,1231 | 22 | 3 180 |
+| *popularidad* | *0,0504* | *1,00×* | | | |
+| naive | 0,0316 | 0,63× | 0,0465 | 8 | 7 910 |
+| svd | 0,0210 | 0,42× | 0,0323 | 49 | 1 453 |
+
+La validación siempre da más que el test: es el optimismo de elegir hiperparámetros mirando
+esos mismos datos, que ahora queda separado del resultado informado.
+
+### Aporte de los atributos
+
+| Dónde | Sin atributos | Con atributos | Qué eligió Optuna |
+|---|---|---|---|
+| EASE (test) | 0,0980 | 0,0981 | Pesos en el mínimo: no usarlos |
+| Dos torres (mejor trial en validación) | 0,1366 | 0,1201 | No usarlos |
+| Ensamble (test) | 0,0973 | **0,1074** | — (LightGBM usa afinidad con el autor 9%, año de edición 9%, popularidad 8%) |
+
+En libros, los atributos no mejoran a los modelos sueltos (lo que leyó cada lector ya dice más
+que el autor o el género), pero sí al ensamble: le permiten reordenar los candidatos de EASE y
+dos torres según la afinidad del lector con el autor.
+
+### Cascadas (832 lectores de Kaggle)
+
+| Cascada | top_n (≤ 2 valoraciones) | vision_tunel (3 a 9) | modelo (≥ 10) |
+|---|---|---|---|
+| todas las cascadas | 43 | 61 | 728 |
+
+(`cascada_svd` manda un lector más a visión de túnel: el filtro de libros le dejó sin datos.)
+
+### Historial de experimentos
+
+Cada fila cambió el esquema de evaluación, así que los NDCG **no son comparables entre filas**
+(cambian los lectores evaluados y la cantidad de libros de test); sirven para comparar modelos
+dentro de cada fila.
+
+| Esquema | Lectores evaluados | Ensamble | EASE | Dos torres | Popularidad |
+|---|---|---|---|---|---|
+| Test = últimas 20, `min_lector` ≥ 20 sobre train, hiperparámetros elegidos en test | 3801 | 0,1251 | 0,1211 | 0,1178 | 0,0889 |
+| Igual, `min_lector` desde 1 | 3801 | 0,1545 | 0,1457 | 0,1479 | 0,0889 |
+| 20 / 10 / 5 (universo / test / validación) | 3890 | 0,1184 | 0,1169 | 0,1130 | 0,0571 |
+| 30 / 10 / 10, modelo final ≥ 10 | 3203 | 0,0973 | 0,0980 | 0,0980 | 0,0504 |
+| **30 / 10 / 10 + atributos (actual)** | **3203** | **0,1074** | **0,0981** | **0,0977** | **0,0504** |
+
+Medidos sobre los mismos 3203 lectores, los esquemas 20 / 10 / 5 y 30 / 10 / 10 rinden casi
+igual (EASE 0,1017 contra 0,0980): la caída entre esas filas se debe a que los lectores de 20 a
+29 interacciones son más fáciles de acertar, no al esquema.
 
 ## Decisiones tomadas
 
 | Decisión | Por qué |
 |---|---|
-| Partición por las últimas 20 interacciones de cada lector | Evaluar como en Kaggle (predecir lo próximo que va a leer) sin que ningún modelo vea el futuro. |
-| El filtro de la base es un hiperparámetro de cada modelo | Antes se usaba una base filtrada fija (más de 35). Cada modelo prefiere un filtro distinto: EASE y las torres casi el mínimo (más cobertura), SVD y naive el máximo (para usarlos lo menos posible). |
-| Evaluar siempre a los mismos lectores, con respaldo de popularidad | Para que un filtro exigente no parezca mejor por evaluar sólo a lectores fáciles. |
+| Partición cronológica por lector (últimas 10 test, 10 anteriores validación) | Evaluar como en Kaggle (predecir lo próximo que va a leer) sin que ningún modelo vea el futuro. |
+| Modelo final con los lectores de 10 o más interacciones | Recomendar con el modelo a todo lector con tanta historia como el train mínimo de la optimización (728 de los 832 lectores de Kaggle, contra 628 con el universo de 30). |
+| Universo fijo: lectores con al menos 30 interacciones | Que todo lector con el que se entrena se evalúe y viceversa, siempre con los mismos lectores. Antes el mínimo por lector era un hiperparámetro aplicado sólo a train, y se evaluaba con lectores que el modelo no había visto (ver [Por qué este esquema](#por-qué-este-esquema)). |
+| Validación separada del test | Que el NDCG informado no esté inflado por haber elegido los hiperparámetros con el mismo test. |
+| El mínimo por libro es un hiperparámetro de cada modelo | Cada modelo tolera distinto los libros con pocas lecturas. |
 | Relevante = cualquier libro leído | Es lo que se predice en Kaggle. En una simulación de Kaggle, los dos criterios (cualquier rating o rating ≥ 8) daban resultados parecidos. |
 | Dos torres con negativos y logQ, gran torre con negativos | Las versiones de clase aproximaban el rating y recomendaban casi lo mismo a todos (el 86% de los lectores recibía el mismo primer libro con la gran torre). |
 | No se agregó complejidad a las redes | Se probó (atributos y capas en dos torres; más capas, dropout, `espania` y antigüedad del libro en gran torre) y no mejoró: Optuna eligió siempre lo más simple. Ver [`reportes/intento_complejidad.md`](reportes/intento_complejidad.md) y [`reportes/literatura.md`](reportes/literatura.md). |
-| Curvas de entrenamiento en los reportes | Muestran que dos torres se estabiliza desde la época 6 y que la gran torre sobreajusta si se entrena de más. |
-| Ensamble con LightGBM | Combinar ayuda (+0,004 sobre EASE). LightGBM rinde igual que un promedio simple de los puntajes estandarizados (0,1251 contra 0,1252), probablemente porque aprende de pocos lectores (1768) y sólo con los puntajes. |
+| Curvas de entrenamiento en los reportes | Muestran si una red sigue aprendiendo o empieza a sobreajustar (la gran torre sobreajusta si se entrena de más). |
+| Ensamble con LightGBM y variables de contenido | Con sólo los puntajes, LightGBM rendía igual que un promedio simple. Con la afinidad con el autor, el género y la editorial, el año y la popularidad, mejora a EASE un 9% (0,1074 contra 0,0981). |
+| Atributos como hiperparámetros en EASE y dos torres | Que Optuna decida si sirven; el primer trial es la mejor configuración sin atributos. En libros no los eligió. |
 | Algoritmos SQL con el ranking global en memoria | Las consultas repetían por lector una agregación de toda la tabla. |
 | Copia de la base sin SQLite | No bloquear al proceso que está modificando `data/data.db`. |
 | KNN se dejó de usar | Predecir libro por libro es muy lento para evaluarlo con Optuna, y no estaba entre los mejores. |
@@ -187,8 +279,12 @@ NDCG@20 en test (detalle en [`reportes/resumen.md`](reportes/resumen.md)):
 
 ## Limitaciones conocidas
 
-- Los NDCG son algo optimistas (los hiperparámetros se eligen en el mismo test).
-- `modelos/ease.pkl` pesa ~530 MB (matriz de 11 mil × 11 mil libros).
+- Los lectores con menos de 10 interacciones no tienen recomendaciones personalizadas de los
+  modelos: los atiende `vision_tunel` en las cascadas.
+- Los lectores de 10 a 29 interacciones reciben el modelo, pero no se pueden evaluar con este
+  esquema.
+- `modelos/ease.pkl` pesa ~400 MB (matriz de 10 mil × 10 mil libros).
+- 78 mil libros no tienen título y no se recomiendan (la app no los puede mostrar).
 - Los modelos se entrenan con una copia de la base: lo que se valore en la app después no lo
   ven hasta volver a correr `pipeline.py`.
 - En `gran_torre` los años (nacimiento, edición) se escalan entre 0 y 1 con los faltantes en 0,

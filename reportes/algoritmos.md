@@ -14,25 +14,30 @@ Hay cuatro familias de algoritmos:
 |---|---|---|
 | Reglas SQL | `random`, `top_n`, `mas_valorados`, `perfil_balanceado`, `vision_tunel` | Consultas fijas sobre la base, sin entrenamiento. |
 | Modelos entrenados | `naive`, `svd`, `ease`, `dos_torres`, `gran_torre` | Aprenden de las valoraciones; hiperparámetros ajustados con Optuna. |
-| Ensamble | `ensamble` | LightGBM combina las recomendaciones de cuatro modelos. |
+| Ensamble | `ensamble`, `promedio` | Combinan las recomendaciones de cuatro modelos (LightGBM o promedio simple). |
 | Cascadas | `cascada_<modelo>` (una por modelo y una por el ensamble) | Eligen el algoritmo según cuánto se conoce al lector. |
 
 ## Cómo se comparan
 
 Los modelos entrenados y el ensamble se miden con el mismo protocolo:
 
-- **Datos:** 461 075 valoraciones de 10 667 lectores sobre 48 063 libros.
-- **Partición cronológica:** las últimas 20 valoraciones de cada lector son el test y las
-  anteriores, el train. Se evalúan los 3801 lectores con más de 20 valoraciones.
+- **Universo de evaluación:** los 3203 lectores con al menos 30 valoraciones. Es fijo: todos los
+  modelos se entrenan y se evalúan con los mismos lectores.
+- **Partición cronológica por lector:** las últimas 10 valoraciones son el test, las 10
+  anteriores la validación y el resto (al menos 10), el train.
+- **Tres etapas:** Optuna elige los hiperparámetros entrenando con train y midiendo en
+  validación; con los mejores se reentrena con train + validación y se mide en test (el número
+  que se informa, que no participó de ninguna elección); el modelo final se entrena con todos
+  los lectores con al menos 10 valoraciones, para recomendar también a los que tienen menos
+  historia que el universo de evaluación.
 - **Métrica: NDCG@20.** Mide si los libros que el lector efectivamente leyó después aparecen
   entre los 20 recomendados y qué tan arriba están (1 = perfecto, 0 = ningún acierto). Cuenta
   como acierto cualquier libro leído, como en Kaggle.
-- **Mismos lectores para todos:** a quien el modelo no conoce se le recomiendan los más leídos.
-  Así un modelo que cubre a pocos lectores no sale beneficiado.
-- **Referencia:** recomendar a todos los más leídos da NDCG@20 = 0,0889.
+- **Referencia:** recomendar a todos los más leídos da NDCG@20 = 0,0504 en test.
 
-Los hiperparámetros se eligen con el mismo test con que se mide, así que los valores son algo
-optimistas. Sirven para comparar los modelos entre sí, no como estimación absoluta.
+Estos NDCG no se comparan con los de versiones anteriores del proyecto (cambiaron los lectores
+evaluados y la cantidad de libros de test): sólo entre sí y contra la popularidad. El historial
+está en el [README](../README.md#historial-de-experimentos).
 
 Los algoritmos SQL no se evalúan con este protocolo, porque consultan la base completa, que
 incluye el test. Su comparación es el puntaje de Kaggle.
@@ -74,8 +79,12 @@ leer el lector.
 Aprende cuánto "empuja" cada libro a cada otro: si leíste A, ¿cuánto sube la probabilidad de
 B? Tiene **solución cerrada**, `B = I − P / diag(P)` con `P = (XᵀX + λI)⁻¹`, sin épocas ni
 descenso por gradiente. X solo registra si el lector leyó el libro o no. El puntaje de un
-libro es la suma de los pesos que le dan los libros que el lector leyó. Su único
-hiperparámetro es la regularización λ.
+libro es la suma de los pesos que le dan los libros que el lector leyó. Su hiperparámetro
+principal es la regularización λ.
+
+Opcionalmente usa **atributos**: cada autor, género, editorial y década actúa como un
+pseudo-lector que "leyó" todos los libros con ese valor, así que dos libros del mismo autor
+suman co-lectura. Optuna elige el peso de cada atributo; en libros los dejó en el mínimo.
 
 ### dos_torres — red neuronal de recuperación
 
@@ -84,6 +93,9 @@ similitud entre los dos. Se entrena para que, en cada lote, el libro que el lect
 quede por encima de los libros elegidos por los demás lectores del lote (**negativos del
 lote**). A cada libro se le descuenta su popularidad (**corrección logQ**, Yi et al. 2019);
 si no, el modelo termina recomendando solo los populares.
+
+Opcionalmente cada torre suma los embeddings de sus **atributos** (libro: autor, género,
+editorial, década; lector: género, década de nacimiento, España). Optuna eligió no usarlos.
 
 ### gran_torre — red neuronal sobre pares
 
@@ -95,104 +107,113 @@ libros al azar no leídos, que se vuelven a sortear en cada época.
 ## Ensamble — LightGBM
 
 1. **Candidatos:** los 50 primeros libros de SVD, EASE, dos torres y gran torre, unidos.
-2. **Variables:** el puntaje y la posición que le da cada modelo a cada candidato.
+2. **Variables:** el puntaje y la posición que le da cada modelo a cada candidato, y de
+   contenido: qué parte de lo que leyó el lector comparte autor, género o editorial con el
+   candidato, el año de edición y la popularidad.
 3. **LightGBM (LambdaRank)** aprende a reordenar los candidatos de cada lector.
 
 Para que no haya fuga de datos, LightGBM aprende de predicciones de modelos que no vieron las
-respuestas: los modelos base se entrenan sin las últimas 20 valoraciones de train y LightGBM
-aprende a predecir esas 20.
+respuestas: los modelos base se entrenan con train y LightGBM aprende a predecir la validación;
+se evalúa en test con modelos base entrenados con train + validación.
+
+**`promedio`** ordena los mismos candidatos por el promedio simple de los puntajes de los
+cuatro modelos (estandarizados por lector), sin LightGBM.
 
 ## Cascadas
 
 | Situación del lector | Algoritmo |
 |---|---|
 | Hasta 2 valoraciones (arranque en frío) | `top_n` |
-| El modelo no lo conoce (quedó afuera del filtro de entrenamiento) | `vision_tunel` |
+| El modelo no lo conoce (menos de 10 valoraciones) | `vision_tunel` |
 | El resto | el modelo (o el ensamble) |
 
 ---
 
 ## Rendimiento comparativo
 
-### NDCG@20 en test
+### NDCG@20
 
-| Puesto | Modelo | NDCG@20 | vs popularidad | Lectores del test cubiertos |
+| Puesto | Modelo | NDCG@20 (test) | vs popularidad | NDCG@20 (validación) |
 |---|---|---|---|---|
-| 1 | **ensamble** | **0,1251** | **1,41×** | 69% |
-| 2 | ease | 0,1211 | 1,36× | 69% |
-| 3 | dos_torres | 0,1178 | 1,33× | 64% |
-| 4 | gran_torre | 0,1070 | 1,20× | 64% |
-| — | *popularidad (referencia)* | *0,0889* | *1,00×* | |
-| 5 | svd | 0,0880 | 0,99× | 13% |
-| 6 | naive | 0,0878 | 0,99× | 14% |
+| 1 | **ensamble** | **0,1074** | **2,13×** | 0,1566 |
+| 2 | ease | 0,0981 | 1,95× | 0,1332 |
+| 3 | dos_torres | 0,0977 | 1,94× | 0,1366 |
+| — | *promedio simple* | *0,0976* | *1,94×* | |
+| 4 | gran_torre | 0,0787 | 1,56× | 0,1231 |
+| — | *popularidad (referencia)* | *0,0504* | *1,00×* | |
+| 5 | naive | 0,0316 | 0,63× | 0,0465 |
+| 6 | svd | 0,0210 | 0,42× | 0,0323 |
 
 ```
-ensamble    ██████████████████████████████████████████  0,1251
-ease        ████████████████████████████████████████    0,1211
-dos_torres  ███████████████████████████████████████     0,1178
-gran_torre  ███████████████████████████████████         0,1070
-popularidad █████████████████████████████               0,0889
-svd         █████████████████████████████               0,0880
-naive       █████████████████████████████               0,0878
+ensamble    ██████████████████████████████████████████  0,1074
+ease        ██████████████████████████████████████      0,0981
+dos_torres  ██████████████████████████████████████      0,0977
+gran_torre  ███████████████████████████████             0,0787
+popularidad ████████████████████                        0,0504
+naive       ████████████                                0,0316
+svd         ████████                                    0,0210
 ```
+
+La validación da siempre más que el test: es el optimismo de elegir los hiperparámetros
+mirando esos datos. Por eso el resultado que se informa es el de test.
 
 ### Qué eligió Optuna y cuánto cuesta cada modelo
 
-| Modelo | Filtro elegido (mín. por lector / por libro) | Libros en el modelo final | Tiempo por trial | Hiperparámetros clave |
-|---|---|---|---|---|
-| naive | 80 / 47 | 776 | < 1 s | reg. libro 140,7; 9 épocas |
-| svd | 80 / 50 | 688 | < 1 s | 11 factores; 5 épocas |
-| ease | 20 / 5 | 11 453 | 16 s | λ = 298,8 |
-| dos_torres | 21 / 18 | 3 645 | 6 s | dimensión 256; temperatura 0,15; 6 épocas |
-| gran_torre | 20 / 23 | 2 880 | 35 s | 6 negativos; 6 épocas |
-| ensamble | — | — | — | 9 hojas; 282 árboles |
+| Modelo | min_libro | Libros en el modelo final | Tiempo por trial | Hiperparámetros clave | Atributos |
+|---|---|---|---|---|---|
+| naive | 8 | 7 910 | 3 s | reg. libro 191; 20 épocas | — |
+| svd | 49 | 1 453 | 5 s | 137 factores; 50 épocas | — |
+| ease | 6 | 10 174 | 11 s | λ = 757 | no (pesos en el mínimo) |
+| dos_torres | 9 | 7 121 | 28 s | dimensión 256; temperatura 0,11; 17 épocas; positivo = rating ≥ 3 | no |
+| gran_torre | 22 | 3 180 | 47 s | 5 negativos; 7 épocas; positivo = rating ≥ 5 | siempre (autor, género, editorial, año) |
+| ensamble | — | — | — | 35 hojas; 487 árboles | variables de contenido |
 
-### Aporte de cada modelo al ensamble
+### Aporte de los atributos
 
-Importancia de las variables en LightGBM (ganancia, sumando puntaje y posición):
+| Dónde | Sin atributos | Con atributos |
+|---|---|---|
+| EASE (test) | 0,0980 | 0,0981 |
+| Dos torres (mejor trial en validación) | 0,1366 | 0,1201 |
+| Ensamble (test) | 0,0973 | **0,1074** |
 
-| Modelo base | Importancia |
+### Qué usa el ensamble
+
+Importancia de las variables en LightGBM (ganancia, sumando puntaje y posición de cada modelo):
+
+| Variables | Importancia |
 |---|---|
-| ease | 52% |
-| dos_torres | 31% |
-| gran_torre | 12% |
-| svd | 5% |
+| ease | 29% |
+| dos_torres | 16% |
+| svd | 11% |
+| gran_torre | 10% |
+| **contenido** (afinidad con el autor 9%, año de edición 9%, popularidad 8%, afinidad con el género 5%, con la editorial 4%) | **35%** |
 
 ## Interpretación
 
 1. **Predecir qué se va a leer supera a predecir el rating.** EASE, dos torres y gran torre
-   aprenden "leyó o no leyó" y superan a la popularidad entre un 20% y un 36%. SVD y naive
-   aprenden el valor del rating y no le ganan a la popularidad: saber que alguien le pondría un
-   9 a un libro no dice si lo va a leer.
-2. **La cobertura pesa.** En todos los modelos, el hiperparámetro más importante (fANOVA) fue el
-   mínimo de valoraciones por lector. Los mejores modelos eligieron el filtro más permisivo
-   (alrededor de 20) para conocer a más lectores. SVD y naive eligieron el más exigente: como
-   no mejoran a la popularidad, les conviene que se use lo menos posible, y cubren solo al
-   13-14% de los lectores.
-3. **El modelo más simple es el mejor modelo individual.** EASE, con un solo hiperparámetro y
-   solución cerrada, supera a las dos redes neuronales. También se probó agregar complejidad a
-   las redes (atributos, más capas, dropout) y no mejoraron; ver
+   aprenden "leyó o no leyó" y duplican a la popularidad. SVD y naive aprenden el valor del
+   rating y quedan **por debajo** de la popularidad: saber que alguien le pondría un 9 a un
+   libro no dice si lo va a leer.
+2. **El modelo más simple es el mejor modelo individual.** EASE, con solución cerrada, empata
+   con dos torres y supera a la gran torre. Agregar complejidad a las redes no las mejoró; ver
    [intento_complejidad.md](intento_complejidad.md).
-4. **Combinar ayuda, pero poco.** El ensamble mejora a EASE en 0,004 (+3%). Un promedio simple
-   de los puntajes estandarizados logra lo mismo (0,1252), así que la mejora viene de combinar
-   los modelos y no de la sofisticación de LightGBM. El ensamble se apoya sobre todo en EASE y
-   dos torres.
-5. **El ensamble no amplía la cobertura.** Cubre a los mismos lectores que EASE (69%), porque
-   EASE es el modelo con el filtro más amplio. En la cascada, los dos reparten igual a los 832
-   lectores de Kaggle:
+3. **Los atributos no ayudan a los modelos sueltos, pero sí al ensamble.** Lo que leyó cada
+   lector ya dice más que el autor o el género del libro. En cambio, para reordenar los
+   candidatos que proponen los modelos, la afinidad del lector con el autor sí suma: el
+   ensamble mejora a EASE un 9% (0,1074 contra 0,0981), y un tercio de lo que usa LightGBM son
+   variables de contenido.
+4. **Sin variables de contenido, combinar no ayudaba:** LightGBM rendía igual que el promedio
+   simple (0,0973 contra 0,0981).
+5. **Las cascadas reparten igual.** Todos los modelos conocen a los mismos lectores (los de 10
+   o más valoraciones). En los 832 lectores de Kaggle:
 
-| Cascada | top_n | visión de túnel | modelo |
+| Cascada | top_n (≤ 2 valoraciones) | visión de túnel (3 a 9) | modelo (≥ 10) |
 |---|---|---|---|
-| cascada_ensamble | 43 | 131 | 658 |
-| cascada_ease | 43 | 131 | 658 |
-| cascada_dos_torres | 43 | 158 | 631 |
-| cascada_gran_torre | 43 | 161 | 628 |
-| cascada_svd | 43 | 592 | 197 |
-| cascada_naive | 43 | 581 | 208 |
+| todas (`cascada_svd`: 62 / 727) | 43 | 61 | 728 |
 
 ## Conclusión
 
-- **Mejor opción: `cascada_ensamble`**, con el mejor NDCG@20 (0,1251).
-- **Alternativa simple: `cascada_ease`.** Pierde solo un 3% y no necesita entrenar cinco
-  modelos ni LightGBM. Su costo es el tamaño del modelo (~530 MB).
-- **SVD y naive** no aportan frente a recomendar lo más leído.
+- **Mejor opción: `cascada_ensamble`**, con el mejor NDCG@20 en test (0,1074), un 9% sobre EASE.
+- **Alternativa simple: `cascada_ease`.** No necesita entrenar cinco modelos ni LightGBM. Su
+  costo es el tamaño del modelo (~400 MB).
+- **SVD y naive** rinden peor que recomendar lo más leído: no conviene usarlos.

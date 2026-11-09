@@ -1,45 +1,52 @@
 # ease
 
-Optimizado el 2026-11-08T12:20 con 50 trials de Optuna (TPE), maximizando NDCG@20.
+Optimizado el 2026-11-09T15:16 con 59 trials de Optuna (TPE), maximizando NDCG@20 en validación.
 
 ## Resultado
 
 | Métrica | Valor |
 |---|---|
-| NDCG@20 (test) | **0.1211** |
-| NDCG@20 de popularidad (referencia) | 0.0889 |
-| Lectores del test cubiertos por el modelo | 69.2% |
-| Libros del modelo (en la evaluación) | 9788 |
-| Tiempo por trial | 16 s |
-| Modelo final: interacciones / lectores / libros | 364589 / 3704 / 11453 |
+| NDCG@20 en test | **0.0981** |
+| NDCG@20 en validación (el que maximizó Optuna) | 0.1332 |
+| NDCG@20 de popularidad en test (referencia) | 0.0504 |
+| Lectores del universo que el modelo conoce (test) | 99.9% |
+| Libros del modelo (en test) | 9087 |
+| Tiempo por trial | 11 s |
+| Modelo final: interacciones / lectores / libros | 377321 / 5228 / 10174 |
 
 ## Hiperparámetros elegidos
 
 | Hiperparámetro | Valor |
 |---|---|
-| min_lector | 20 |
-| min_libro | 5 |
-| lambda | 298.8 |
+| min_libro | 6 |
+| lambda | 756.8 |
+| peso_autor | 0.001302 |
+| peso_genero | 0.0012 |
+| peso_editorial | 0.001762 |
+| peso_decada | 0.001147 |
 
 ## Importancia de cada hiperparámetro (fANOVA)
 
 | Hiperparámetro | Importancia |
 |---|---|
-| min_lector | 0.72 |
-| lambda | 0.23 |
+| lambda | 0.68 |
+| peso_genero | 0.17 |
+| peso_editorial | 0.06 |
 | min_libro | 0.05 |
+| peso_autor | 0.04 |
+| peso_decada | 0.01 |
 
 ## Mejores trials
 
-| # | NDCG@20 | min_lector | min_libro | lambda |
-|---|---|---|---|---|
-| 37 | 0.1211 | 20 | 5 | 298.8 |
-| 46 | 0.1202 | 20 | 8 | 540.8 |
-| 33 | 0.1201 | 20 | 8 | 518.9 |
-| 22 | 0.1197 | 20 | 10 | 367.7 |
-| 45 | 0.1196 | 21 | 8 | 656.9 |
-| 36 | 0.1194 | 20 | 5 | 1908 |
-| 38 | 0.1192 | 21 | 5 | 244.4 |
-| 28 | 0.1182 | 20 | 13 | 289.8 |
-| 41 | 0.1178 | 23 | 6 | 449.8 |
-| 44 | 0.1173 | 22 | 6 | 161.1 |
+| # | NDCG@20 (validación) | min_libro | lambda | peso_autor | peso_genero | peso_editorial | peso_decada |
+|---|---|---|---|---|---|---|---|
+| 58 | 0.1332 | 6 | 756.8 | 0.001302 | 0.0012 | 0.001762 | 0.001147 |
+| 0 | 0.1332 | 5 | 771.5 | 0.001 | 0.001 | 0.001 | 0.001 |
+| 37 | 0.1331 | 6 | 761.8 | 0.001819 | 0.002091 | 0.001287 | 0.009554 |
+| 50 | 0.1327 | 6 | 1024 | 0.007752 | 0.001623 | 0.005811 | 0.007592 |
+| 47 | 0.1326 | 6 | 662.5 | 0.0042 | 0.003546 | 0.001585 | 0.002677 |
+| 42 | 0.1326 | 5 | 608.8 | 0.001438 | 0.001144 | 0.002389 | 0.001672 |
+| 23 | 0.1325 | 5 | 618.2 | 0.02202 | 0.01143 | 0.007648 | 0.001089 |
+| 53 | 0.1325 | 5 | 585.1 | 0.003042 | 0.006178 | 0.007653 | 0.00955 |
+| 57 | 0.1325 | 8 | 630.4 | 0.00224 | 0.001714 | 0.001867 | 0.004299 |
+| 51 | 0.1323 | 5 | 1282 | 0.004817 | 0.002124 | 0.002148 | 0.001313 |

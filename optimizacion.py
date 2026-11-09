@@ -9,35 +9,41 @@ import datos
 import modelos
 
 
-# Ajuste de hiperparámetros con Optuna, maximizando NDCG@20 en la partición
-# cronológica de datos.particionar (las últimas 20 interacciones de cada lector).
+# Ajuste de hiperparámetros con Optuna, maximizando NDCG@20, sobre la
+# partición de datos.particiones (universo de lectores con al menos 20
+# interacciones; por lector, las últimas 10 son test, las 5 anteriores
+# validación y el resto train).
 #
 # Decisiones de diseño:
-# - El filtro de la base (mínimo de interacciones por lector y por libro) es un
-#   hiperparámetro y se aplica sólo a train, para no usar información del test.
-# - Se evalúa siempre a los mismos lectores (todos los que tienen test), sea
-#   cual sea el filtro. Los que el filtro deja afuera reciben los libros más
-#   leídos de train. Si no, un filtro más exigente se evaluaría sólo con
-#   lectores más fáciles y parecería mejor de lo que es.
-# - Relevante = cualquier libro leído en el test (el rating no importa), igual
-#   que en las predicciones de Kaggle: acertar qué va a leer el lector.
-# - El NDCG de los mejores hiperparámetros se mide en el mismo test con el que
-#   se eligieron, así que es algo optimista.
+# - Tres etapas: Optuna entrena con train y mide en validación; con los mejores
+#   hiperparámetros se reentrena con train + validación y se mide en test (el
+#   NDCG que se informa: el test no participó de ninguna elección); el modelo
+#   final se entrena con todos los lectores con al menos datos.MIN_LECTOR_FINAL
+#   interacciones, para recomendar también a los que tienen menos historia que
+#   el universo de evaluación.
+# - Todos los lectores del universo se entrenan y se evalúan, siempre los
+#   mismos en todos los trials, así los NDCG son comparables.
+# - El mínimo de interacciones por libro es un hiperparámetro y se cuenta sólo
+#   sobre los datos de entrenamiento de cada etapa, para no usar lecturas futuras.
+# - Relevante = cualquier libro leído (el rating no importa), igual que en las
+#   predicciones de Kaggle: acertar qué va a leer el lector.
 K = 20
-TRIALS = {'naive': 50, 'svd': 50, 'ease': 50, 'dos_torres': 50, 'gran_torre': 30}
+TRIALS = {'naive': 50, 'svd': 50, 'ease': 60, 'dos_torres': 50, 'gran_torre': 30}
 ESTUDIOS = 'sqlite:///' + os.path.join(datos.RAIZ, 'data', 'trabajo', 'optuna.db')
 CARPETA_REPORTES = os.path.join(datos.RAIZ, 'reportes')
 DESCUENTO = 1 / np.log2(np.arange(2, K + 2))
 
 
 class Evaluador:
-    # Mide NDCG@K de un modelo entrenado sobre train contra el test
+    # Mide NDCG@K de un modelo entrenado sobre train contra lo que el lector
+    # leyó después (validación o test)
     def __init__(self, train, test):
         self.test = test.groupby('id_lector')['id_libro'].apply(set).to_dict()
         self.lectores = sorted(self.test)
         leidos = train.groupby('id_lector')['id_libro'].apply(set).to_dict()
-        # respaldo para los lectores que el modelo no conoce: los más leídos de
-        # train (sin filtrar) que el lector todavía no leyó
+        # respaldo para los lectores que el modelo no conoce (alguno al que el
+        # filtro de libros le sacó todo, y la referencia de popularidad): los
+        # más leídos de train (sin filtrar) que el lector todavía no leyó
         populares = train['id_libro'].value_counts().index.to_numpy()
         self.respaldo = {}
         for l in self.lectores:
@@ -73,9 +79,10 @@ class Evaluador:
                 'libros': len(m['ids_libros']), 'lectores_modelo': len(m['indice_lector'])}
 
 
-def optimizar(nombre, train, test, base, trials=None, continuar=False):
-    # Busca los hiperparámetros con Optuna (TPE). El estudio se guarda en
-    # data/trabajo/optuna.db, así que con continuar=True se retoma uno cortado
+def optimizar(nombre, train, validacion, base, trials=None, continuar=False):
+    # Busca los hiperparámetros con Optuna (TPE): entrena con train y mide en
+    # validación. El estudio se guarda en data/trabajo/optuna.db, así que con
+    # continuar=True se retoma uno cortado
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     if not continuar:
         try:
@@ -84,13 +91,17 @@ def optimizar(nombre, train, test, base, trials=None, continuar=False):
             pass
     estudio = optuna.create_study(study_name=nombre, storage=ESTUDIOS, direction='maximize', load_if_exists=True,
                                   sampler=optuna.samplers.TPESampler(seed=modelos.SEMILLA))
-    ev = Evaluador(train, test)
+    faltan = (trials or TRIALS[nombre]) - len(estudio.trials)  # antes de encolar: un trial encolado ya cuenta
+    if not estudio.trials:
+        for params in modelos.INICIALES.get(nombre, []):
+            estudio.enqueue_trial(params)
+    ev = Evaluador(train, validacion)
 
     def objetivo(trial):
-        # entrena con los hiperparámetros del trial y devuelve su NDCG@20
+        # entrena con los hiperparámetros del trial y devuelve su NDCG@20 en validación
         inicio = time.time()
         params = modelos.sugerir(nombre, trial)
-        filtrado = datos.filtrar(train, params['min_lector'], params['min_libro'])
+        filtrado = datos.filtrar_libros(train, params['min_libro'])
         r = ev.evaluar(modelos.entrenar(nombre, filtrado, params, base))
         r['segundos'] = round(time.time() - inicio)
         for k, v in r.items():
@@ -98,23 +109,38 @@ def optimizar(nombre, train, test, base, trials=None, continuar=False):
         print(f"  {nombre} trial {trial.number}: ndcg {r['ndcg']:.4f} ({r['segundos']} s) {params}", flush=True)
         return r['ndcg']
 
-    faltan = (trials or TRIALS[nombre]) - len(estudio.trials)
     if faltan > 0:
         estudio.optimize(objetivo, n_trials=faltan)
-    return estudio, ev.ndcg(ev.respaldo)
+    return estudio
 
 
-def entrenar_final(nombre, estudio, todos, base, ndcg_popularidad):
-    # Con los mejores hiperparámetros: filtro y entrenamiento con todos los datos
-    # (train + test). Se guarda en el .pkl el registro de la optimización
-    params = modelos.sugerir(nombre, optuna.trial.FixedTrial(estudio.best_params))
-    filtrado = datos.filtrar(todos, params['min_lector'], params['min_libro'])
+def mejores_params(nombre, estudio):
+    # los hiperparámetros del mejor trial, completos (como los arma sugerir)
+    return modelos.sugerir(nombre, optuna.trial.FixedTrial(estudio.best_params))
+
+
+def medir_test(nombre, params, resto, test, base):
+    # Reentrena con train + validación (resto) y mide en test: es el NDCG que
+    # se informa. También devuelve la referencia de popularidad en test
+    ev = Evaluador(resto, test)
+    r = ev.evaluar(modelos.entrenar(nombre, datos.filtrar_libros(resto, params['min_libro']), params, base))
+    r['ndcg_popularidad'] = ev.ndcg(ev.respaldo)
+    return r
+
+
+def entrenar_final(nombre, estudio, universo, base, prueba):
+    # Con los mejores hiperparámetros: entrenamiento con el universo final
+    # (todas sus interacciones). Se guarda en el .pkl el registro de la
+    # optimización y de la medición en test (prueba, de medir_test)
+    params = mejores_params(nombre, estudio)
+    filtrado = datos.filtrar_libros(universo, params['min_libro'])
     m = modelos.entrenar(nombre, filtrado, params, base)
     m['optimizacion'] = {
         'fecha': datetime.datetime.now().isoformat(timespec='minutes'),
-        'ndcg': estudio.best_value,
-        'ndcg_popularidad': ndcg_popularidad,
-        'evaluacion': estudio.best_trial.user_attrs,
+        'ndcg': prueba['ndcg'],
+        'ndcg_validacion': estudio.best_value,
+        'ndcg_popularidad': prueba['ndcg_popularidad'],
+        'evaluacion': {**prueba, 'segundos': estudio.best_trial.user_attrs.get('segundos')},
         'trials': len(estudio.trials),
         'interacciones': len(filtrado),
     }
@@ -122,14 +148,15 @@ def entrenar_final(nombre, estudio, todos, base, ndcg_popularidad):
     return m
 
 
-def curva(nombre, params, train, test, base, epocas):
+def curva(nombre, params, train, validacion, base, epocas):
     # Curva de entrenamiento de una red: con los hiperparámetros elegidos se
     # entrena sobre train durante `epocas` (más que las elegidas, para ver qué
     # pasa después) y en cada época se registran la pérdida de entrenamiento y
-    # el NDCG@20 en test. Sirve para ver si la red sigue aprendiendo (le falta
-    # capacidad o épocas) o si empieza a sobreajustar.
-    ev = Evaluador(train, test)
-    filtrado = datos.filtrar(train, params['min_lector'], params['min_libro'])
+    # el NDCG@20 en validación (la cantidad de épocas es una elección, así que
+    # se mira en validación y no en test). Sirve para ver si la red sigue
+    # aprendiendo (le falta capacidad o épocas) o si empieza a sobreajustar.
+    ev = Evaluador(train, validacion)
+    filtrado = datos.filtrar_libros(train, params['min_libro'])
     puntos = []
 
     def al_final_de_epoca(epoca, perdida, armar):
@@ -152,7 +179,7 @@ def _graficar_curva(nombre, puntos, epocas_elegidas):
     superficie, serie, tinta, tenue, grilla = '#fcfcfb', '#2a78d6', '#2b2a27', '#6b6a64', '#e4e3de'
     epoca, perdida, ndcg = zip(*puntos)
     fig, ejes = plt.subplots(2, 1, figsize=(7, 5.2), sharex=True, facecolor=superficie)
-    for ax, valores, titulo in ((ejes[0], perdida, 'Pérdida de entrenamiento'), (ejes[1], ndcg, 'NDCG@20 en test')):
+    for ax, valores, titulo in ((ejes[0], perdida, 'Pérdida de entrenamiento'), (ejes[1], ndcg, 'NDCG@20 en validación')):
         ax.set_facecolor(superficie)
         ax.plot(epoca, valores, color=serie, linewidth=2, marker='o', markersize=4)
         ax.axvline(epocas_elegidas, color=tenue, linewidth=1, linestyle='--')
@@ -195,13 +222,14 @@ def reporte_modelo(nombre, estudio, m, puntos_curva=None):
     ev = o['evaluacion']
     lineas = [
         f'# {nombre}', '',
-        f"Optimizado el {o['fecha']} con {o['trials']} trials de Optuna (TPE), maximizando NDCG@{K}.", '',
+        f"Optimizado el {o['fecha']} con {o['trials']} trials de Optuna (TPE), maximizando NDCG@{K} en validación.", '',
         '## Resultado', '',
         '| Métrica | Valor |', '|---|---|',
-        f"| NDCG@{K} (test) | **{o['ndcg']:.4f}** |",
-        f"| NDCG@{K} de popularidad (referencia) | {o['ndcg_popularidad']:.4f} |",
-        f"| Lectores del test cubiertos por el modelo | {ev['lectores_cubiertos']:.1%} |",
-        f"| Libros del modelo (en la evaluación) | {ev['libros']} |",
+        f"| NDCG@{K} en test | **{o['ndcg']:.4f}** |",
+        f"| NDCG@{K} en validación (el que maximizó Optuna) | {o['ndcg_validacion']:.4f} |",
+        f"| NDCG@{K} de popularidad en test (referencia) | {o['ndcg_popularidad']:.4f} |",
+        f"| Lectores del universo que el modelo conoce (test) | {ev['lectores_cubiertos']:.1%} |",
+        f"| Libros del modelo (en test) | {ev['libros']} |",
         f"| Tiempo por trial | {ev['segundos']} s |",
         f"| Modelo final: interacciones / lectores / libros | {o['interacciones']} / {len(m['indice_lector'])} / {len(m['ids_libros'])} |",
         '', '## Hiperparámetros elegidos', '',
@@ -218,7 +246,7 @@ def reporte_modelo(nombre, estudio, m, puntos_curva=None):
     completos = sorted((t for t in estudio.trials if t.value is not None), key=lambda t: -t.value)
     claves = list(m['params'])
     lineas += ['', '## Mejores trials', '',
-               '| # | NDCG@20 | ' + ' | '.join(claves) + ' |',
+               '| # | NDCG@20 (validación) | ' + ' | '.join(claves) + ' |',
                '|---|---|' + '---|' * len(claves),
                *[f'| {t.number} | {t.value:.4f} | ' + ' | '.join(_fmt(t.params.get(k)) for k in claves) + ' |'
                  for t in completos[:10]]]
@@ -227,7 +255,7 @@ def reporte_modelo(nombre, estudio, m, puntos_curva=None):
                    f"Con los hiperparámetros elegidos, entrenando sobre train más épocas que las elegidas "
                    f"({m['params']['epochs']}, línea punteada).", '',
                    f'![Curva de entrenamiento de {nombre}](curva_{nombre}.png)', '',
-                   '| Época | Pérdida | NDCG@20 |', '|---|---|---|',
+                   '| Época | Pérdida | NDCG@20 (validación) |', '|---|---|---|',
                    *[f'| {e} | {p:.4f} | {n:.4f} |' for e, p, n in puntos_curva]]
     os.makedirs(CARPETA_REPORTES, exist_ok=True)
     with open(os.path.join(CARPETA_REPORTES, f'{nombre}.md'), 'w', encoding='utf-8') as f:
