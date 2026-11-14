@@ -18,6 +18,7 @@ Los resultados detallados están en [`reportes/`](reportes/resumen.md).
 | `optimizacion.py` | Evaluación (NDCG@20), Optuna, entrenamiento final, curvas de entrenamiento y reportes. |
 | `ensamble.py` | El ensamble con LightGBM sobre las predicciones de los modelos. |
 | `pipeline.py` | El proceso completo, para volver a correrlo cuando cambie la base. |
+| `scraping/completar_libros.py` | Completa los datos faltantes de los libros desde quelibroleo.com (independiente del resto). |
 | `templates/` | Páginas de la app. |
 | `modelos/` | Los modelos entrenados (`.pkl`), no versionados. |
 | `reportes/` | Reportes en markdown para la presentación. |
@@ -35,7 +36,45 @@ flask --app app run                     # la aplicación
 ```
 
 Dependencias (Python 3.13): Flask, NumPy, pandas, SciPy, scikit-surprise, Keras con JAX,
-Optuna, LightGBM y matplotlib.
+Optuna, LightGBM y matplotlib. El script de scraping necesita además `scrapling[fetchers]`.
+
+## Datos de los libros (`scraping/completar_libros.py`)
+
+Completa los campos vacíos de la tabla `libros` (`titulo`, `autor`, `genero`, `editorial`,
+`anio_edicion` y `resumen`) con la ficha de cada libro en `https://quelibroleo.com/<id_libro>`,
+usando scrapling. Escribe directamente en `data/data.db`.
+
+```bash
+python scraping/completar_libros.py --dry-run --limite 20   # prueba sin escribir
+python scraping/completar_libros.py                         # todas las filas incompletas
+python scraping/completar_libros.py --pausa 1.5             # segundos entre pedidos (1 por defecto)
+python scraping/completar_libros.py --reintentar-fallidos   # vuelve a pedir las páginas ya marcadas
+```
+
+- Sólo escribe los campos vacíos: nunca pisa datos existentes.
+- Guarda cada libro al procesarlo, así que se puede cortar y retomar.
+- Los títulos se guardan en mayúsculas, como los que ya estaban en la base.
+- El año 1900 se toma como desconocido: el sitio lo muestra cuando no tiene el dato.
+- Los libros que dan 404, o cuya página no tiene todos los datos faltantes, quedan en la tabla
+  `libros_scraping_fallidos` (con el motivo) y no se vuelven a pedir.
+- A ~2,2 s por libro, unos 80 mil libros llevan alrededor de 48 horas.
+
+En noviembre de 2026 completó unos 78 mil libros que no tenían ningún dato. Faltan:
+
+| Campo | Vacíos antes | Vacíos después |
+|---|---|---|
+| titulo | 78 222 | 281 |
+| autor | 78 227 | 286 |
+| genero | 78 222 | 281 |
+| editorial | 78 230 | 289 |
+| anio_edicion | 78 222 | 610 |
+| resumen | 79 947 | 14 146 |
+
+Los ~280 que siguen sin título, autor, género ni editorial son libros que ya no existen en el
+sitio. Los resúmenes que faltan son de libros que el sitio tiene sin resumen. Al volver a
+entrenar, los modelos no cambiaron (no usan el título y los atributos ya estaban completos);
+sí cambiaron `vision_tunel` y las cascadas, que ahora pueden recomendar los libros que antes
+no tenían título.
 
 ## El proceso (`pipeline.py`)
 
@@ -284,7 +323,13 @@ igual (EASE 0,1017 contra 0,0980): la caída entre esas filas se debe a que los 
 - Los lectores de 10 a 29 interacciones reciben el modelo, pero no se pueden evaluar con este
   esquema.
 - `modelos/ease.pkl` pesa ~400 MB (matriz de 10 mil × 10 mil libros).
-- 78 mil libros no tienen título y no se recomiendan (la app no los puede mostrar).
+- 281 libros no tienen título y no se recomiendan (la app no los puede mostrar). Son libros que
+  ya no existen en quelibroleo.com.
+- Hay libros con más de una edición, cada una con su propio `id_libro` (por ejemplo
+  `el-principito`, `el-principito-1` y `el-principito-2`), así que sus valoraciones quedan
+  repartidas. Unificarlas es una tarea pendiente: no alcanza con el sufijo numérico del id
+  (muchos son tomos de una serie), habría que agrupar por título y autor y pasar las
+  valoraciones de `interacciones` a un id común.
 - Los modelos se entrenan con una copia de la base: lo que se valore en la app después no lo
   ven hasta volver a correr `pipeline.py`.
 - En `gran_torre` los años (nacimiento, edición) se escalan entre 0 y 1 con los faltantes en 0,
