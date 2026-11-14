@@ -1,6 +1,6 @@
 # dos_torres
 
-Optimizado el 2026-11-09T15:34 con 49 trials de Optuna (TPE), maximizando NDCG@20 en validación.
+Optimizado el 2026-11-11T19:58 con 50 trials de Optuna (TPE), maximizando NDCG@20 en validación.
 
 ## Resultado
 
@@ -11,7 +11,7 @@ Optimizado el 2026-11-09T15:34 con 49 trials de Optuna (TPE), maximizando NDCG@2
 | NDCG@20 de popularidad en test (referencia) | 0.0504 |
 | Lectores del universo que el modelo conoce (test) | 99.9% |
 | Libros del modelo (en test) | 6347 |
-| Tiempo por trial | 28 s |
+| Tiempo por trial | 26 s |
 | Modelo final: interacciones / lectores / libros | 356420 / 5224 / 7121 |
 
 ## Hiperparámetros elegidos
@@ -30,10 +30,10 @@ Optimizado el 2026-11-09T15:34 con 49 trials de Optuna (TPE), maximizando NDCG@2
 
 | Hiperparámetro | Importancia |
 |---|---|
-| temperatura | 0.66 |
+| temperatura | 0.67 |
 | min_libro | 0.16 |
 | epochs | 0.11 |
-| learning_rate | 0.03 |
+| learning_rate | 0.02 |
 | rating_positivo | 0.02 |
 | dim | 0.02 |
 | atributos | 0.00 |
@@ -50,8 +50,8 @@ Optimizado el 2026-11-09T15:34 con 49 trials de Optuna (TPE), maximizando NDCG@2
 | 41 | 0.1351 | 7 | 4 | 256 | 0.123 | 0.003282 | 19 | False |
 | 34 | 0.1351 | 10 | 4 | 256 | 0.1039 | 0.001921 | 20 | False |
 | 39 | 0.1350 | 11 | 5 | 256 | 0.1208 | 0.002836 | 15 | False |
+| 49 | 0.1347 | 8 | 4 | 256 | 0.1286 | 0.008542 | 19 | False |
 | 46 | 0.1344 | 8 | 7 | 256 | 0.1087 | 0.002439 | 18 | False |
-| 38 | 0.1337 | 9 | 6 | 256 | 0.1393 | 0.001312 | 18 | False |
 
 ## Curva de entrenamiento
 

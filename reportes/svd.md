@@ -1,6 +1,6 @@
 # svd
 
-Optimizado el 2026-11-09T15:03 con 50 trials de Optuna (TPE), maximizando NDCG@20 en validación.
+Optimizado el 2026-11-11T19:27 con 50 trials de Optuna (TPE), maximizando NDCG@20 en validación.
 
 ## Resultado
 
@@ -11,7 +11,7 @@ Optimizado el 2026-11-09T15:03 con 50 trials de Optuna (TPE), maximizando NDCG@2
 | NDCG@20 de popularidad en test (referencia) | 0.0504 |
 | Lectores del universo que el modelo conoce (test) | 99.8% |
 | Libros del modelo (en test) | 1249 |
-| Tiempo por trial | 5 s |
+| Tiempo por trial | 3 s |
 | Modelo final: interacciones / lectores / libros | 248998 / 5205 / 1453 |
 
 ## Hiperparámetros elegidos

@@ -1,6 +1,6 @@
 # naive
 
-Optimizado el 2026-11-09T15:00 con 50 trials de Optuna (TPE), maximizando NDCG@20 en validación.
+Optimizado el 2026-11-11T19:24 con 50 trials de Optuna (TPE), maximizando NDCG@20 en validación.
 
 ## Resultado
 
@@ -11,7 +11,7 @@ Optimizado el 2026-11-09T15:00 con 50 trials de Optuna (TPE), maximizando NDCG@2
 | NDCG@20 de popularidad en test (referencia) | 0.0504 |
 | Lectores del universo que el modelo conoce (test) | 99.9% |
 | Libros del modelo (en test) | 7068 |
-| Tiempo por trial | 3 s |
+| Tiempo por trial | 2 s |
 | Modelo final: interacciones / lectores / libros | 362732 / 5224 / 7910 |
 
 ## Hiperparámetros elegidos

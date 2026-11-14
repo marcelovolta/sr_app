@@ -1,6 +1,6 @@
 # Ensamble (LightGBM)
 
-Optimizado el 2026-11-09T16:10 con 30 trials de Optuna (TPE), maximizando NDCG@20 en validación (lectores apartados de la etapa A).
+Optimizado el 2026-11-11T20:27 con 30 trials de Optuna (TPE), maximizando NDCG@20 en validación (lectores apartados de la etapa A).
 
 ## Cómo funciona
 

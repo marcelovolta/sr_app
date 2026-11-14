@@ -1,6 +1,6 @@
 # gran_torre
 
-Optimizado el 2026-11-09T15:58 con 30 trials de Optuna (TPE), maximizando NDCG@20 en validación.
+Optimizado el 2026-11-11T20:16 con 30 trials de Optuna (TPE), maximizando NDCG@20 en validación.
 
 ## Resultado
 
@@ -11,7 +11,7 @@ Optimizado el 2026-11-09T15:58 con 30 trials de Optuna (TPE), maximizando NDCG@2
 | NDCG@20 de popularidad en test (referencia) | 0.0504 |
 | Lectores del universo que el modelo conoce (test) | 99.9% |
 | Libros del modelo (en test) | 2776 |
-| Tiempo por trial | 47 s |
+| Tiempo por trial | 35 s |
 | Modelo final: interacciones / lectores / libros | 303794 / 5218 / 3180 |
 
 ## Hiperparámetros elegidos
