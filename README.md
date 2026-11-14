@@ -53,7 +53,7 @@ python scraping/completar_libros.py --reintentar-fallidos   # vuelve a pedir las
 
 - Sólo escribe los campos vacíos: nunca pisa datos existentes.
 - Guarda cada libro al procesarlo, así que se puede cortar y retomar.
-- Los títulos se guardan en mayúsculas, como los que ya estaban en la base.
+- Los títulos se guardan en mayúsculas, como la mayoría de los que ya estaban en la base.
 - El año 1900 se toma como desconocido: el sitio lo muestra cuando no tiene el dato.
 - Los libros que dan 404, o cuya página no tiene todos los datos faltantes, quedan en la tabla
   `libros_scraping_fallidos` (con el motivo) y no se vuelven a pedir.
